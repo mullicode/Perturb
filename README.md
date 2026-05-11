@@ -287,9 +287,15 @@ Miner response field:
 
 Per-response score (if verification passes):
 
-- `perturbation_score = 1 - min(norm / epsilon, 1)`
+- Hard gates:
+  - `min_linf_delta <= norm <= min(epsilon, max_linf_delta)`
+  - `ssim(clean, adv) >= min_ssim`
+  - `psnr_db(clean, adv) >= min_psnr_db`
+  - predicted label must differ from the original label
+- `ratio = clamp((norm - min_linf_delta) / (min(epsilon, max_linf_delta) - min_linf_delta), 0, 1)`
+- `perturbation_score = (1 - ratio)^2`
 - `speed_score = 1 - min(response_time / timeout, 1)`
-- `final = 0.65 * perturbation_score + 0.35 * speed_score`
+- `final = PERTURB_PERTURBATION_WEIGHT * perturbation_score + PERTURB_SPEED_WEIGHT * speed_score`
 
 Any verification or constraint failure gets `0.0`.
 

@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import logging as pylogging
+import math
 import os
 import random
 import time
@@ -16,6 +17,7 @@ import bittensor as bt
 import numpy as np
 import requests
 import torch
+import torch.nn.functional as F
 
 from perturbnet import constants as C
 from perturbnet.image_io import decode_image_b64
@@ -42,6 +44,8 @@ class EvaluationResult:
     model_prediction: str = ""
     norm: float = 0.0
     epsilon: float = 0.0
+    ssim: float = 0.0
+    psnr_db: float = 0.0
 
 
 def _make_wallet(config):
@@ -120,6 +124,36 @@ def _configure_log_level(level_raw: str) -> None:
             bt_logger.set_info(True)
     except Exception:
         pass
+
+
+def _compute_ssim(x_clean: torch.Tensor, x_adv: torch.Tensor, kernel_size: int = 11) -> float:
+    if x_clean.ndim != 3 or x_adv.ndim != 3:
+        return 0.0
+    if x_clean.shape != x_adv.shape:
+        return 0.0
+    padding = kernel_size // 2
+    x = x_clean.unsqueeze(0)
+    y = x_adv.unsqueeze(0)
+    c1 = 0.01 ** 2
+    c2 = 0.03 ** 2
+
+    mu_x = F.avg_pool2d(x, kernel_size=kernel_size, stride=1, padding=padding)
+    mu_y = F.avg_pool2d(y, kernel_size=kernel_size, stride=1, padding=padding)
+    sigma_x = F.avg_pool2d(x * x, kernel_size=kernel_size, stride=1, padding=padding) - mu_x * mu_x
+    sigma_y = F.avg_pool2d(y * y, kernel_size=kernel_size, stride=1, padding=padding) - mu_y * mu_y
+    sigma_xy = F.avg_pool2d(x * y, kernel_size=kernel_size, stride=1, padding=padding) - mu_x * mu_y
+
+    numerator = (2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)
+    denominator = (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x + sigma_y + c2)
+    ssim_map = numerator / (denominator + 1e-12)
+    return float(ssim_map.mean().item())
+
+
+def _compute_psnr_db(x_clean: torch.Tensor, x_adv: torch.Tensor) -> float:
+    mse = float(torch.mean((x_adv - x_clean) ** 2).item())
+    if mse <= 1e-12:
+        return 99.0
+    return 10.0 * math.log10(1.0 / mse)
 
 
 class PerturbValidator:
@@ -551,7 +585,8 @@ class PerturbValidator:
                 norm=float(norm),
                 epsilon=float(challenge.epsilon),
             )
-        if norm > min(float(challenge.epsilon), float(self.config.perturb.max_linf_delta)):
+        effective_max_delta = min(float(challenge.epsilon), float(self.config.perturb.max_linf_delta))
+        if norm > effective_max_delta:
             return EvaluationResult(
                 score=0.0,
                 reason="above_max_delta",
@@ -571,8 +606,35 @@ class PerturbValidator:
                 epsilon=float(challenge.epsilon),
             )
 
-        perturbation_ratio = norm / max(1e-12, float(challenge.epsilon))
-        perturbation_score = 1.0 - min(perturbation_ratio, 1.0)
+        ssim = _compute_ssim(x_clean=x_clean, x_adv=x_adv)
+        min_ssim = float(getattr(self.config.perturb, "min_ssim", 0.98))
+        if ssim < min_ssim:
+            return EvaluationResult(
+                score=0.0,
+                reason="below_min_ssim",
+                model_prediction=normalized_prediction,
+                norm=float(norm),
+                epsilon=float(challenge.epsilon),
+                ssim=float(ssim),
+            )
+
+        psnr_db = _compute_psnr_db(x_clean=x_clean, x_adv=x_adv)
+        min_psnr_db = float(getattr(self.config.perturb, "min_psnr_db", 0.0))
+        if min_psnr_db > 0.0 and psnr_db < min_psnr_db:
+            return EvaluationResult(
+                score=0.0,
+                reason="below_min_psnr_db",
+                model_prediction=normalized_prediction,
+                norm=float(norm),
+                epsilon=float(challenge.epsilon),
+                ssim=float(ssim),
+                psnr_db=float(psnr_db),
+            )
+
+        denom = max(1e-12, effective_max_delta - float(self.config.perturb.min_linf_delta))
+        perturbation_ratio = (norm - float(self.config.perturb.min_linf_delta)) / denom
+        perturbation_ratio = min(max(perturbation_ratio, 0.0), 1.0)
+        perturbation_score = (1.0 - perturbation_ratio) ** 2
 
         time_ratio = response_time_ms / (challenge.timeout_seconds * 1000.0)
         speed_score = 1.0 - min(time_ratio, 1.0)
@@ -584,6 +646,8 @@ class PerturbValidator:
             model_prediction=normalized_prediction,
             norm=float(norm),
             epsilon=float(challenge.epsilon),
+            ssim=float(ssim),
+            psnr_db=float(psnr_db),
         )
 
     def _update_histories(self, uids: Sequence[int], rewards: Sequence[float]) -> None:
@@ -779,7 +843,8 @@ class PerturbValidator:
                         f"uid={uid} status={status_code} score={score:.6f} "
                         f"processed={int(self.processed_counts[uid]) + 1} "
                         f"reason={result.reason} model_prediction={result.model_prediction} "
-                        f"norm={result.norm:.6f} epsilon={result.epsilon:.6f}"
+                        f"norm={result.norm:.6f} epsilon={result.epsilon:.6f} "
+                        f"ssim={result.ssim:.6f} psnr_db={result.psnr_db:.4f}"
                     )
 
                 self._log_step_start("loop_update_histories")
