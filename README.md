@@ -292,8 +292,11 @@ Per-response score (if verification passes):
   - `ssim(clean, adv) >= min_ssim`
   - `psnr_db(clean, adv) >= min_psnr_db`
   - predicted label must differ from the original label
-- `ratio = clamp((norm - min_linf_delta) / (min(epsilon, max_linf_delta) - min_linf_delta), 0, 1)`
-- `perturbation_score = (1 - ratio)^2`
+- `linf_ratio = clamp((norm - min_linf_delta) / (min(epsilon, max_linf_delta) - min_linf_delta), 0, 1)`
+- `rmse_ratio = clamp(rmse / min(epsilon, max_linf_delta), 0, 1)`
+- `linf_score = (1 - linf_ratio)^2`
+- `rmse_score = (1 - rmse_ratio)^2`
+- `perturbation_score = weighted_avg(linf_score, rmse_score)` using `PERTURB_LINF_COMPONENT_WEIGHT` and `PERTURB_RMSE_COMPONENT_WEIGHT`
 - `speed_score = 1 - min(response_time / timeout, 1)`
 - `final = PERTURB_PERTURBATION_WEIGHT * perturbation_score + PERTURB_SPEED_WEIGHT * speed_score`
 

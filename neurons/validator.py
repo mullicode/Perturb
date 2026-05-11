@@ -43,6 +43,7 @@ class EvaluationResult:
     reason: str
     model_prediction: str = ""
     norm: float = 0.0
+    rmse: float = 0.0
     epsilon: float = 0.0
     ssim: float = 0.0
     psnr_db: float = 0.0
@@ -592,6 +593,7 @@ class PerturbValidator:
                 reason="above_max_delta",
                 model_prediction=prediction,
                 norm=float(norm),
+                rmse=float(torch.sqrt(torch.mean((x_adv - x_clean) ** 2)).item()),
                 epsilon=float(challenge.epsilon),
             )
 
@@ -603,8 +605,11 @@ class PerturbValidator:
                 reason="label_match_with_original",
                 model_prediction=normalized_prediction,
                 norm=float(norm),
+                rmse=float(torch.sqrt(torch.mean((x_adv - x_clean) ** 2)).item()),
                 epsilon=float(challenge.epsilon),
             )
+
+        rmse = float(torch.sqrt(torch.mean((x_adv - x_clean) ** 2)).item())
 
         ssim = _compute_ssim(x_clean=x_clean, x_adv=x_adv)
         min_ssim = float(getattr(self.config.perturb, "min_ssim", 0.98))
@@ -614,6 +619,7 @@ class PerturbValidator:
                 reason="below_min_ssim",
                 model_prediction=normalized_prediction,
                 norm=float(norm),
+                rmse=float(rmse),
                 epsilon=float(challenge.epsilon),
                 ssim=float(ssim),
             )
@@ -626,15 +632,25 @@ class PerturbValidator:
                 reason="below_min_psnr_db",
                 model_prediction=normalized_prediction,
                 norm=float(norm),
+                rmse=float(rmse),
                 epsilon=float(challenge.epsilon),
                 ssim=float(ssim),
                 psnr_db=float(psnr_db),
             )
 
         denom = max(1e-12, effective_max_delta - float(self.config.perturb.min_linf_delta))
-        perturbation_ratio = (norm - float(self.config.perturb.min_linf_delta)) / denom
-        perturbation_ratio = min(max(perturbation_ratio, 0.0), 1.0)
-        perturbation_score = (1.0 - perturbation_ratio) ** 2
+        linf_ratio = (norm - float(self.config.perturb.min_linf_delta)) / denom
+        linf_ratio = min(max(linf_ratio, 0.0), 1.0)
+        linf_score = (1.0 - linf_ratio) ** 2
+
+        rmse_ratio = rmse / max(1e-12, effective_max_delta)
+        rmse_ratio = min(max(rmse_ratio, 0.0), 1.0)
+        rmse_score = (1.0 - rmse_ratio) ** 2
+
+        linf_weight = float(getattr(self.config.perturb, "linf_component_weight", 0.7))
+        rmse_weight = float(getattr(self.config.perturb, "rmse_component_weight", 0.3))
+        total_weight = max(1e-12, linf_weight + rmse_weight)
+        perturbation_score = ((linf_weight * linf_score) + (rmse_weight * rmse_score)) / total_weight
 
         time_ratio = response_time_ms / (challenge.timeout_seconds * 1000.0)
         speed_score = 1.0 - min(time_ratio, 1.0)
@@ -645,6 +661,7 @@ class PerturbValidator:
             reason="success",
             model_prediction=normalized_prediction,
             norm=float(norm),
+            rmse=float(rmse),
             epsilon=float(challenge.epsilon),
             ssim=float(ssim),
             psnr_db=float(psnr_db),
@@ -843,7 +860,7 @@ class PerturbValidator:
                         f"uid={uid} status={status_code} score={score:.6f} "
                         f"processed={int(self.processed_counts[uid]) + 1} "
                         f"reason={result.reason} model_prediction={result.model_prediction} "
-                        f"norm={result.norm:.6f} epsilon={result.epsilon:.6f} "
+                        f"norm={result.norm:.6f} rmse={result.rmse:.6f} epsilon={result.epsilon:.6f} "
                         f"ssim={result.ssim:.6f} psnr_db={result.psnr_db:.4f}"
                     )
 
