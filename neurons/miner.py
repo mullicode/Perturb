@@ -12,6 +12,8 @@ from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import load_efficientnet_v2_m, logits_for_images, predict_index, resolve_target_index
 from perturbnet.protocol import AttackChallenge
 
+logger = pylogging.getLogger(__name__)
+
 
 def _make_wallet(config):
     wallet_name = getattr(config.wallet, "name", getattr(config, "wallet_name", "default"))
@@ -76,21 +78,11 @@ def _make_axon(wallet, config):
 def _configure_log_level(level_raw: str) -> None:
     level_name = (level_raw or "DEBUG").upper()
     level = getattr(pylogging, level_name, pylogging.INFO)
+    pylogging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    )
     pylogging.getLogger().setLevel(level)
-    bt_logger = getattr(bt, "logging", None)
-    if bt_logger is None:
-        return
-    try:
-        if level_name == "DEBUG" and hasattr(bt_logger, "set_debug"):
-            bt_logger.set_debug(True)
-        elif level_name in {"WARNING", "WARN"} and hasattr(bt_logger, "set_warning"):
-            bt_logger.set_warning(True)
-        elif level_name == "ERROR" and hasattr(bt_logger, "set_error"):
-            bt_logger.set_error(True)
-        elif hasattr(bt_logger, "set_info"):
-            bt_logger.set_info(True)
-    except Exception:
-        pass
 
 
 class PerturbMiner:
@@ -114,9 +106,9 @@ class PerturbMiner:
     def _log_step_start(self, step_name: str, **context: typing.Any) -> None:
         if context:
             rendered = " ".join([f"{k}={v}" for k, v in context.items()])
-            bt.logging.info(f"[STEP_START] {step_name} {rendered}")
+            logger.info(f"[STEP_START] {step_name} {rendered}")
         else:
-            bt.logging.info(f"[STEP_START] {step_name}")
+            logger.info(f"[STEP_START] {step_name}")
 
     def _init_subtensor_with_retry(self):
         max_attempts = int(os.getenv("SUBTENSOR_CONNECT_RETRIES", "5"))
@@ -124,11 +116,11 @@ class PerturbMiner:
         last_error = None
         for attempt in range(1, max_attempts + 1):
             try:
-                bt.logging.info(f"[MINER] Connecting subtensor (attempt {attempt}/{max_attempts})")
+                logger.info(f"[MINER] Connecting subtensor (attempt {attempt}/{max_attempts})")
                 return _make_subtensor(config=self.config)
             except Exception as err:
                 last_error = err
-                bt.logging.warning(f"[MINER] Subtensor connect failed on attempt {attempt}: {err}")
+                logger.warning(f"[MINER] Subtensor connect failed on attempt {attempt}: {err}")
                 if attempt < max_attempts:
                     time.sleep(retry_delay_seconds * attempt)
         raise RuntimeError(f"Failed to connect subtensor after {max_attempts} attempts: {last_error}")
@@ -139,11 +131,11 @@ class PerturbMiner:
         last_error = None
         for attempt in range(1, max_attempts + 1):
             try:
-                bt.logging.info(f"[MINER] Loading metagraph netuid={self.config.netuid} (attempt {attempt}/{max_attempts})")
+                logger.info(f"[MINER] Loading metagraph netuid={self.config.netuid} (attempt {attempt}/{max_attempts})")
                 return self.subtensor.metagraph(netuid=self.config.netuid)
             except Exception as err:
                 last_error = err
-                bt.logging.warning(f"[MINER] Metagraph load failed on attempt {attempt}: {err}")
+                logger.warning(f"[MINER] Metagraph load failed on attempt {attempt}: {err}")
                 if attempt < max_attempts:
                     time.sleep(retry_delay_seconds * attempt)
         raise RuntimeError(f"Failed to load metagraph after {max_attempts} attempts: {last_error}")
@@ -159,14 +151,14 @@ class PerturbMiner:
             epsilon=getattr(synapse, "epsilon", "unknown"),
         )
         if synapse.norm_type != "Linf":
-            bt.logging.info(f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unsupported norm_type={synapse.norm_type}")
+            logger.info(f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unsupported norm_type={synapse.norm_type}")
             synapse.perturbed_image_b64 = synapse.clean_image_b64
             return synapse
 
         clean = decode_image_b64(synapse.clean_image_b64).to(self.device)
         target_index = resolve_target_index(synapse.true_label)
         if target_index is None:
-            bt.logging.warning(
+            logger.warning(
                 f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unresolved true_label={getattr(synapse, 'true_label', None)}"
             )
             synapse.perturbed_image_b64 = synapse.clean_image_b64
@@ -202,7 +194,7 @@ class PerturbMiner:
 
         adv = best
         synapse.perturbed_image_b64 = encode_image_b64(adv)
-        bt.logging.info(
+        logger.info(
             f"Finished task={getattr(synapse, 'task_id', 'unknown')} target_idx={target_index} "
             f"final_pred={final_pred} best_delta={best_delta:.6f} min_delta={min_delta:.6f}"
         )
@@ -215,20 +207,20 @@ class PerturbMiner:
             caller_hotkey=getattr(getattr(synapse, "dendrite", None), "hotkey", None),
         )
         if synapse.dendrite is None or synapse.dendrite.hotkey is None:
-            bt.logging.warning("Blacklist reject: missing caller hotkey")
+            logger.warning("Blacklist reject: missing caller hotkey")
             return True, "Missing caller hotkey"
 
         hotkey = synapse.dendrite.hotkey
         if hotkey not in self.metagraph.hotkeys:
-            bt.logging.warning(f"Blacklist reject: unregistered caller hotkey={hotkey}")
+            logger.warning(f"Blacklist reject: unregistered caller hotkey={hotkey}")
             return True, "Unregistered caller"
 
         uid = self.metagraph.hotkeys.index(hotkey)
         if not self.metagraph.validator_permit[uid]:
-            bt.logging.warning(f"Blacklist reject: caller uid={uid} lacks validator permit")
+            logger.warning(f"Blacklist reject: caller uid={uid} lacks validator permit")
             return True, "Caller is not validator"
 
-        bt.logging.info(f"Blacklist allow: caller uid={uid} hotkey={hotkey}")
+        logger.info(f"Blacklist allow: caller uid={uid} hotkey={hotkey}")
         return False, "OK"
 
     async def priority(self, synapse: AttackChallenge) -> float:
@@ -238,14 +230,14 @@ class PerturbMiner:
             caller_hotkey=getattr(getattr(synapse, "dendrite", None), "hotkey", None),
         )
         if synapse.dendrite is None or synapse.dendrite.hotkey is None:
-            bt.logging.info("Priority=0.0: missing caller hotkey")
+            logger.info("Priority=0.0: missing caller hotkey")
             return 0.0
         if synapse.dendrite.hotkey not in self.metagraph.hotkeys:
-            bt.logging.info(f"Priority=0.0: unknown hotkey={synapse.dendrite.hotkey}")
+            logger.info(f"Priority=0.0: unknown hotkey={synapse.dendrite.hotkey}")
             return 0.0
         uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
         priority = float(self.metagraph.S[uid])
-        bt.logging.info(f"Priority computed: uid={uid} priority={priority:.6f}")
+        logger.info(f"Priority computed: uid={uid} priority={priority:.6f}")
         return priority
 
     def run(self) -> None:
@@ -254,13 +246,13 @@ class PerturbMiner:
         if self.wallet.hotkey.ss58_address not in self.metagraph.hotkeys:
             raise RuntimeError("Miner hotkey is not registered on this netuid.")
 
-        bt.logging.info(
+        logger.info(
             f"Serving miner axon {self.axon} on network: {self.config.subtensor.network} with netuid: {self.config.netuid}"
         )
         self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
         self.axon.start()
 
-        bt.logging.info("Miner started. Waiting for validator queries.")
+        logger.info("Miner started. Waiting for validator queries.")
         while True:
             time.sleep(12)
             self.sync()

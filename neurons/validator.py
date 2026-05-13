@@ -29,6 +29,8 @@ from perturbnet.image_io import decode_image_b64
 from perturbnet.model import load_efficientnet_v2_m, normalize_prediction_label, predict_label
 from perturbnet.protocol import AttackChallenge
 
+logger = pylogging.getLogger(__name__)
+
 
 @dataclass
 class ChallengeSpec:
@@ -117,21 +119,11 @@ def _make_axon(wallet, config):
 def _configure_log_level(level_raw: str) -> None:
     level_name = (level_raw or "DEBUG").upper()
     level = getattr(pylogging, level_name, pylogging.INFO)
+    pylogging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    )
     pylogging.getLogger().setLevel(level)
-    bt_logger = getattr(bt, "logging", None)
-    if bt_logger is None:
-        return
-    try:
-        if level_name == "DEBUG" and hasattr(bt_logger, "set_debug"):
-            bt_logger.set_debug(True)
-        elif level_name in {"WARNING", "WARN"} and hasattr(bt_logger, "set_warning"):
-            bt_logger.set_warning(True)
-        elif level_name == "ERROR" and hasattr(bt_logger, "set_error"):
-            bt_logger.set_error(True)
-        elif hasattr(bt_logger, "set_info"):
-            bt_logger.set_info(True)
-    except Exception:
-        pass
 
 
 def _compute_ssim(x_clean: torch.Tensor, x_adv: torch.Tensor, kernel_size: int = 11) -> float:
@@ -224,16 +216,16 @@ class PerturbValidator:
     def _log_step_start(self, step_name: str, **context: Any) -> None:
         if context:
             rendered = " ".join([f"{k}={v}" for k, v in context.items()])
-            bt.logging.info(f"{step_name} {rendered}")
+            logger.info(f"{step_name} {rendered}")
         else:
-            bt.logging.info(step_name)
+            logger.info(step_name)
 
     def _log_summary(self, event: str, **context: Any) -> None:
         if context:
             rendered = " ".join([f"{k}={v}" for k, v in context.items()])
-            bt.logging.info(f"[run_id={self.run_id}] {event} {rendered}")
+            logger.info(f"[run_id={self.run_id}] {event} {rendered}")
         else:
-            bt.logging.info(f"[run_id={self.run_id}] {event}")
+            logger.info(f"[run_id={self.run_id}] {event}")
 
     def sync(self) -> None:
         old_n = int(self.metagraph.n)
@@ -257,7 +249,7 @@ class PerturbValidator:
     def _reset_uid_stats(self, uid: int, reason: str) -> None:
         self.processed_counts[uid] = 0
         self.score_histories[uid] = []
-        bt.logging.info(f"Reset uid={uid} stats due to {reason}.")
+        logger.info(f"Reset uid={uid} stats due to {reason}.")
 
     def _reconcile_uid_identities(self) -> None:
         n = int(self.metagraph.n)
@@ -320,7 +312,7 @@ class PerturbValidator:
         if not bool(getattr(self.config.perturb, "wandb_enabled", False)):
             return
         if wandb is None:
-            bt.logging.warning("PERTURB_WANDB_ENABLED is true, but `wandb` is not installed.")
+            logger.warning("PERTURB_WANDB_ENABLED is true, but `wandb` is not installed.")
             return
         try:
             init_kwargs: dict[str, Any] = {
@@ -345,9 +337,9 @@ class PerturbValidator:
             init_kwargs["mode"] = mode
             self.wandb_run = wandb.init(**init_kwargs)
             self._attach_wandb_console_handler()
-            bt.logging.info("W&B logging initialized for validator.")
+            logger.info("W&B logging initialized for validator.")
         except Exception as exc:
-            bt.logging.warning(f"Failed to initialize W&B logging: {exc}")
+            logger.warning(f"Failed to initialize W&B logging: {exc}")
             self.wandb_run = None
 
     def _resolve_validator_uid_for_run_name(self) -> str:
@@ -387,7 +379,7 @@ class PerturbValidator:
         try:
             self.wandb_run.log(payload, step=int(self.step))
         except Exception as exc:
-            bt.logging.warning(f"W&B log failed: {exc}")
+            logger.warning(f"W&B log failed: {exc}")
 
     def _finish_wandb(self) -> None:
         self._detach_wandb_console_handler()
@@ -396,7 +388,7 @@ class PerturbValidator:
         try:
             self.wandb_run.finish()
         except Exception as exc:
-            bt.logging.warning(f"W&B finish failed: {exc}")
+            logger.warning(f"W&B finish failed: {exc}")
         finally:
             self.wandb_run = None
 
@@ -435,7 +427,7 @@ class PerturbValidator:
         ).strip()
         normalized_prediction = normalize_prediction_label(predicted_label)
         if not endpoint:
-            bt.logging.error("LLM endpoint url is empty; rejecting verification check.")
+            logger.error("LLM endpoint url is empty; rejecting verification check.")
             return False
 
         payload = {
@@ -457,11 +449,11 @@ class PerturbValidator:
             response.raise_for_status()
             parsed = self._parse_llm_endpoint_result(response.json())
             if parsed is None:
-                bt.logging.error("LLM endpoint returned unrecognized payload shape; rejecting check.")
+                logger.error("LLM endpoint returned unrecognized payload shape; rejecting check.")
                 return False
             return bool(parsed)
         except Exception as exc:
-            bt.logging.error(
+            logger.error(
                 f"LLM endpoint request failed ({exc}); timeout={timeout_seconds}s; rejecting check."
             )
             return False
@@ -533,7 +525,7 @@ class PerturbValidator:
         for attempt in range(self.config.perturb.max_challenge_attempts):
             seed = base_seed + attempt
             chosen_prompt = self._choose_prompt(seed)
-            bt.logging.info(f"Selected category: {chosen_prompt}")
+            logger.info(f"Selected category: {chosen_prompt}")
             self._log_step_start(
                 "challenge_attempt",
                 attempt=attempt + 1,
@@ -546,14 +538,14 @@ class PerturbValidator:
                 effective_prompt = chosen_prompt
                 used_fallback = False
             except Exception as exc:
-                bt.logging.warning(f"Challenge image fetch failed ({exc}), using fallback dog image.")
+                logger.warning(f"Challenge image fetch failed ({exc}), using fallback dog image.")
                 try:
                     self._log_step_start("challenge_load_fallback_image", label=C.FALLBACK_LABEL)
                     image_b64 = self._load_fallback_image_b64()
                     effective_prompt = C.FALLBACK_LABEL
                     used_fallback = True
                 except Exception as fallback_exc:
-                    bt.logging.warning(f"Fallback image load failed, retrying: {fallback_exc}")
+                    logger.warning(f"Fallback image load failed, retrying: {fallback_exc}")
                     continue
 
             epsilon = self._sample_epsilon(seed)
@@ -565,18 +557,18 @@ class PerturbValidator:
                 image = decode_image_b64(image_b64).to(self.device)
                 predicted = predict_label(self.model, image)
                 predicted_label = normalize_prediction_label(predicted)
-                bt.logging.info(f"Output label: {predicted_label}")
+                logger.info(f"Output label: {predicted_label}")
             except Exception as exc:
-                bt.logging.warning(f"Challenge decode/model validation failed, retrying: {exc}")
+                logger.warning(f"Challenge decode/model validation failed, retrying: {exc}")
                 continue
 
             # Verify the candidate by semantically checking model output against the API prompt label.
             verify_ok = self._llm_endpoint_check(predicted_label, effective_prompt)
-            bt.logging.info(
+            logger.info(
                 f"verify-label passed={verify_ok}"
             )
             if not verify_ok:
-                bt.logging.info("Sleeping 60s after llm verify-label failure before next challenge attempt.")
+                logger.info("Sleeping 60s after llm verify-label failure before next challenge attempt.")
                 time.sleep(60)
                 continue
 
@@ -827,7 +819,7 @@ class PerturbValidator:
             eligible.append((uid, avg_score))
 
         if not eligible:
-            bt.logging.warning(f"No eligible miners with processed_count >= {min_processed}.")
+            logger.warning(f"No eligible miners with processed_count >= {min_processed}.")
             return
 
         eligible.sort(key=lambda x: (x[1], -x[0]), reverse=True)
@@ -846,7 +838,7 @@ class PerturbValidator:
         # Only miners with positive average score may receive non-zero emissions.
         positive_uids = [uid for uid, avg_score in eligible if avg_score > 0.0]
         if not positive_uids:
-            bt.logging.warning("No miners with positive average score; setting all weights to zero.")
+            logger.warning("No miners with positive average score; setting all weights to zero.")
             zero_weights = np.zeros(int(self.metagraph.n), dtype=np.float32)
             uids = list(range(len(zero_weights)))
             ok, msg = self.subtensor.set_weights(
@@ -858,13 +850,13 @@ class PerturbValidator:
                 wait_for_finalization=False,
             )
             if ok:
-                bt.logging.info("set_weights success (all zero)")
+                logger.info("set_weights success (all zero)")
             else:
-                bt.logging.error(f"set_weights failed (all zero): {msg}")
+                logger.error(f"set_weights failed (all zero): {msg}")
             return
         active_emission_total = float(sum(float(emission_raw[uid]) for uid in positive_uids))
         if active_emission_total <= 0.0:
-            bt.logging.warning("No positive-score miners in weighted rank buckets; setting all weights to zero.")
+            logger.warning("No positive-score miners in weighted rank buckets; setting all weights to zero.")
             zero_weights = np.zeros(int(self.metagraph.n), dtype=np.float32)
             uids = list(range(len(zero_weights)))
             ok, msg = self.subtensor.set_weights(
@@ -876,9 +868,9 @@ class PerturbValidator:
                 wait_for_finalization=False,
             )
             if ok:
-                bt.logging.info("set_weights success (all zero)")
+                logger.info("set_weights success (all zero)")
             else:
-                bt.logging.error(f"set_weights failed (all zero): {msg}")
+                logger.error(f"set_weights failed (all zero): {msg}")
             return
 
         normalized = np.zeros(int(self.metagraph.n), dtype=np.float32)
@@ -886,7 +878,7 @@ class PerturbValidator:
             normalized[uid] = float(emission_raw[uid]) / active_emission_total
         for rank0, (uid, avg_score) in enumerate(eligible):
             rank = rank0 + 1
-            bt.logging.info(
+            logger.info(
                 f"rank={rank} uid={uid} avg100={avg_score:.6f} emission_raw={emission_raw[uid]:.6f} emission={normalized[uid]:.6f}"
             )
         top_weight_items: list[str] = []
@@ -917,9 +909,9 @@ class PerturbValidator:
             wait_for_finalization=False,
         )
         if ok:
-            bt.logging.info("set_weights success")
+            logger.info("set_weights success")
         else:
-            bt.logging.error(f"set_weights failed: {msg}")
+            logger.error(f"set_weights failed: {msg}")
 
     def run(self) -> None:
         self._log_step_start("validator_boot")
@@ -932,7 +924,7 @@ class PerturbValidator:
         self.axon.start()
 
         tempo = self.subtensor.get_subnet_hyperparameters(self.config.netuid).tempo
-        bt.logging.info(f"Validator started with tempo={tempo}")
+        logger.info(f"Validator started with tempo={tempo}")
         self._log_summary(
             "validator_config",
             timeout=self.config.perturb.timeout_seconds,
@@ -956,7 +948,7 @@ class PerturbValidator:
                 block = self.subtensor.get_current_block()
                 self._log_step_start("loop_generate_challenge", block=block)
                 challenge = self.generate_challenge(block=block)
-                bt.logging.info(
+                logger.info(
                     f"Challenge task={challenge.task_id} prompt={challenge.prompt} eps={challenge.epsilon:.4f}"
                 )
                 self._log_summary(
@@ -972,17 +964,17 @@ class PerturbValidator:
                 self._log_step_start("loop_discover_miners")
                 available_uids = self._available_miner_uids()
                 if not available_uids:
-                    bt.logging.warning("No miners available")
+                    logger.warning("No miners available")
                     time.sleep(self.config.perturb.query_interval_seconds)
                     continue
                 self._log_step_start("loop_select_miners", candidate_count=len(available_uids))
                 valuable_uids = self._valuable_miner_uids(available_uids)
                 miner_uids = self._select_random_miners(available_uids, seed=self._seed_from_block(block))
                 if not miner_uids:
-                    bt.logging.warning("Miner selection is empty")
+                    logger.warning("Miner selection is empty")
                     time.sleep(self.config.perturb.query_interval_seconds)
                     continue
-                bt.logging.info(
+                logger.info(
                     f"Selected {len(miner_uids)} miners (valuable pool={len(valuable_uids)}, total pool={len(available_uids)})"
                 )
 
@@ -1012,7 +1004,7 @@ class PerturbValidator:
                     rewards.append(score)
                     results_by_uid.append((uid, result))
                     self.reason_counts_total[result.reason] += 1
-                    bt.logging.info(
+                    logger.info(
                         f"uid={uid} status={status_code} score={score:.6f} "
                         f"processed={int(self.processed_counts[uid]) + 1} "
                         f"reason={result.reason} "
@@ -1055,14 +1047,14 @@ class PerturbValidator:
                 self._log_step_start("loop_sleep", seconds=self.config.perturb.query_interval_seconds)
                 time.sleep(self.config.perturb.query_interval_seconds)
             except KeyboardInterrupt:
-                bt.logging.info("Validator stopped by user.")
+                logger.info("Validator stopped by user.")
                 self._log_summary(
                     "reason_totals",
                     counts=",".join([f"{k}:{v}" for k, v in sorted(self.reason_counts_total.items())]),
                 )
                 break
             except Exception as exc:
-                bt.logging.error(f"Validator loop error: {exc}")
+                logger.error(f"Validator loop error: {exc}")
                 time.sleep(5)
         if not self._query_loop.is_closed():
             self._query_loop.close()
