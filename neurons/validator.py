@@ -100,22 +100,6 @@ def _make_dendrite(wallet):
     return dendrite_cls(wallet=wallet)
 
 
-def _make_axon(wallet, config):
-    resolved_config = config() if callable(config) else config
-    if hasattr(bt, "axon"):
-        try:
-            return bt.axon(wallet=wallet, config=resolved_config)
-        except Exception:
-            return bt.axon(wallet=wallet)
-    axon_cls = getattr(bt, "Axon", None)
-    if axon_cls is None:
-        raise RuntimeError("No axon constructor found in bittensor.")
-    try:
-        return axon_cls(wallet=wallet, config=resolved_config)
-    except Exception:
-        return axon_cls(wallet=wallet)
-
-
 def _configure_log_level(level_raw: str) -> None:
     level_name = (level_raw or "DEBUG").upper()
     requested_level = getattr(pylogging, level_name, pylogging.INFO)
@@ -191,7 +175,6 @@ class PerturbValidator:
         self.subtensor = _make_subtensor(config=self.config)
         self.metagraph = self.subtensor.metagraph(netuid=self.config.netuid)
         self.dendrite = _make_dendrite(wallet=self.wallet)
-        self.axon = _make_axon(wallet=self.wallet, config=self.config)
         self._query_loop = asyncio.new_event_loop()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.system_random = random.SystemRandom()
@@ -920,10 +903,6 @@ class PerturbValidator:
         if self.wallet.hotkey.ss58_address not in self.metagraph.hotkeys:
             raise RuntimeError("Validator hotkey is not registered on this netuid.")
 
-        self._log_step_start("validator_serve_axon", port=getattr(self.config.axon, "port", "unknown"))
-        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
-        self.axon.start()
-
         tempo = self.subtensor.get_subnet_hyperparameters(self.config.netuid).tempo
         logger.info(f"Validator started with tempo={tempo}")
         self._log_summary(
@@ -1074,13 +1053,6 @@ def build_config() -> bt.config:
     parser.add_argument("--wallet.hotkey", dest="wallet_hotkey", type=str, default=os.getenv("HOTKEY_NAME", "default"))
     parser.add_argument("--logging-dir", dest="logging_dir", type=str, default=os.getenv("LOGGING_DIR", "./logs"))
     parser.add_argument("--log-level", dest="log_level", type=str, default=os.getenv("LOG_LEVEL", "DEBUG"))
-    parser.add_argument(
-        "--axon.port",
-        dest="axon_port",
-        type=int,
-        default=int(os.getenv("VALIDATOR_PORT", os.getenv("AXON_PORT", "8090"))),
-    )
-
     if hasattr(bt, "config"):
         config = bt.config(parser)
     else:
@@ -1099,16 +1071,6 @@ def build_config() -> bt.config:
         config.logging = type("LoggingConfig", (), {})()
     config.logging.logging_dir = getattr(config.logging, "logging_dir", getattr(config, "logging_dir", "./logs"))
     config.log_level = getattr(config, "log_level", os.getenv("LOG_LEVEL", "DEBUG"))
-
-    if not hasattr(config, "axon"):
-        config.axon = type("AxonConfig", (), {})()
-    config.axon.port = int(getattr(config.axon, "port", getattr(config, "axon_port", 8090)))
-    config.axon.ip = getattr(config.axon, "ip", os.getenv("VALIDATOR_IP", os.getenv("AXON_IP", "0.0.0.0")))
-    config.axon.external_ip = getattr(config.axon, "external_ip", os.getenv("VALIDATOR_EXTERNAL_IP", None))
-    config.axon.external_port = int(
-        getattr(config.axon, "external_port", os.getenv("VALIDATOR_EXTERNAL_PORT", str(config.axon.port)))
-    )
-    config.axon.max_workers = int(getattr(config.axon, "max_workers", os.getenv("AXON_MAX_WORKERS", "10")))
 
     perturb_cfg = type("PerturbConfig", (), {})()
     config.perturb = perturb_cfg

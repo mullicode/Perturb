@@ -29,7 +29,6 @@ NETWORK="${NETWORK:-local}"
 VALIDATOR_EXTRA_ARGS="${VALIDATOR_EXTRA_ARGS:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 LOG_LEVEL="${LOG_LEVEL:-DEBUG}"
-VALIDATOR_PORT="${VALIDATOR_PORT:-8090}"
 
 if [[ -z "$WALLET_NAME" || -z "$WALLET_HOTKEY" ]]; then
   echo "WALLET_NAME and WALLET_HOTKEY must be set in $ENV_FILE"
@@ -51,13 +50,12 @@ python -m pip install -r requirements.txt
 python -m pip install -e .
 
 if [[ "${1:-}" == "--foreground" ]]; then
-  echo "Starting validator (wallet=$WALLET_NAME hotkey=$WALLET_HOTKEY netuid=$NETUID network=$NETWORK port=$VALIDATOR_PORT)..."
+  echo "Starting validator (wallet=$WALLET_NAME hotkey=$WALLET_HOTKEY netuid=$NETUID network=$NETWORK)..."
   python neurons/validator.py \
     --netuid "$NETUID" \
     --network "$NETWORK" \
     --wallet.name "$WALLET_NAME" \
     --wallet.hotkey "$WALLET_HOTKEY" \
-    --axon.port "$VALIDATOR_PORT" \
     --log-level "$LOG_LEVEL" \
     $VALIDATOR_EXTRA_ARGS
   exit 0
@@ -73,7 +71,6 @@ pm2 start ".venv/bin/python" --name perturb-validator -- \
   --network "$NETWORK" \
   --wallet.name "$WALLET_NAME" \
   --wallet.hotkey "$WALLET_HOTKEY" \
-  --axon.port "$VALIDATOR_PORT" \
   --log-level "$LOG_LEVEL" \
   $VALIDATOR_EXTRA_ARGS
 pm2 save
