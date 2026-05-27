@@ -14,7 +14,7 @@ This repository provides:
 ### Validator responsibilities
 
 - Pull challenge images from Pexels Search API (`PERTURB_IMAGE_ENDPOINT`)
-- Run fixed classifier (`EfficientNetV2-M`) on pulled image
+- Run fixed classifier (`EfficientNetV2-L`) on pulled image
 - Verify semantic consistency of model output vs prompt label through local `llm_endpoint`
 - Build and broadcast `AttackChallenge` synapse to selected miners
 - Verify miner responses and compute rewards
@@ -32,7 +32,7 @@ This repository provides:
 1. Validator samples a prompt from `perturbnet/constants.py` (`PROMPTS`)
 2. Validator fetches image from Pexels using `query=<prompt>` and random page/photo selection
 3. If API pull fails, validator falls back to `assets/dog_1.jpg` and sets prompt to `dog`
-4. Validator runs `EfficientNetV2-M` and gets exact model label string
+4. Validator runs `EfficientNetV2-L` and gets exact model label string
 5. Validator calls local `llm_endpoint` (`POST /verify-label`) to confirm semantic match between model label and prompt
 6. On success, validator creates challenge where `true_label` is the exact EfficientNet label
 7. Validator sends challenge to sampled miners and scores returned perturbations
@@ -276,7 +276,7 @@ Operations endpoints:
 Key fields sent to miners:
 
 - `task_id`
-- `model_name` (fixed `EfficientNetV2-M`)
+- `model_name` (fixed `EfficientNetV2-L`)
 - `prompt` (broad label)
 - `clean_image_b64`
 - `true_label` (exact EfficientNet class label)
@@ -323,7 +323,7 @@ The smoke test validates:
 
 - llm_endpoint health and semantic sanity checks
 - image fetch from configured image endpoint
-- local EfficientNetV2-M inference path
+- local EfficientNetV2-L inference path
 - challenge semantic verification through llm endpoint
 
 ## Troubleshooting

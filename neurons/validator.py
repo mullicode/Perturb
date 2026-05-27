@@ -26,7 +26,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 from perturbnet import constants as C
 from perturbnet.image_io import decode_image_b64
-from perturbnet.model import load_efficientnet_v2_m, normalize_prediction_label, predict_label
+from perturbnet.model import load_efficientnet_v2_l, normalize_prediction_label, predict_label
 from perturbnet.protocol import AttackChallenge
 
 logger = pylogging.getLogger(__name__)
@@ -180,7 +180,7 @@ class PerturbValidator:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.system_random = random.SystemRandom()
 
-        self.model = load_efficientnet_v2_m(self.device)
+        self.model = load_efficientnet_v2_l(self.device)
         self.step = 0
         self.last_weight_block = 0
         self.state_path = os.path.join(self.config.logging.logging_dir, C.VALIDATOR_STATE_FILENAME)
@@ -877,9 +877,9 @@ class PerturbValidator:
             rank = rank0 + 1
             rank_to_uid[rank] = uid
 
-        # Fixed top-3 emission schedule; ranks 4+ intentionally receive zero.
-        top3_shares = (0.70, 0.29, 0.01)
-        for rank, share in enumerate(top3_shares, start=1):
+        # Fixed top-5 emission schedule; ranks 6+ intentionally receive zero.
+        top5_shares = (0.70, 0.25, 0.03, 0.015, 0.005)
+        for rank, share in enumerate(top5_shares, start=1):
             if rank <= n_eligible:
                 emission_raw[rank_to_uid[rank]] = float(share)
 
@@ -930,13 +930,13 @@ class PerturbValidator:
                 f"rank={rank} uid={uid} avg_score={avg_score:.6f} emission_raw={emission_raw[uid]:.6f} emission={normalized[uid]:.6f}"
             )
         top_weight_items: list[str] = []
-        for rank, (uid, avg_score) in enumerate(eligible[:10], start=1):
+        for rank, (uid, avg_score) in enumerate(eligible[:5], start=1):
             top_weight_items.append(f"r{rank}:uid{uid}:avg={avg_score:.4f}:w={normalized[uid]:.4f}")
         self._log_summary(
             "weights_summary",
             eligible=n_eligible,
-            distributed=min(10, n_eligible),
-            top10="|".join(top_weight_items) if top_weight_items else "none",
+            distributed=min(5, n_eligible),
+            top5="|".join(top_weight_items) if top_weight_items else "none",
         )
 
         # Scale miner emissions by configured share; route remainder to uid 0.

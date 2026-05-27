@@ -9,7 +9,7 @@ import requests
 import torch
 
 from perturbnet.image_io import decode_image_b64
-from perturbnet.model import load_efficientnet_v2_m, predict_label
+from perturbnet.model import load_efficientnet_v2_l, predict_label
 
 
 def _require_ok(response: requests.Response, context: str) -> dict[str, Any]:
@@ -96,9 +96,9 @@ def main() -> int:
         raise RuntimeError("downloaded pexels image is empty")
     image_b64 = base64.b64encode(image_response.content).decode("utf-8")
 
-    print("[4/5] Run EfficientNetV2-M inference")
+    print("[4/5] Run EfficientNetV2-L inference")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_efficientnet_v2_m(device=device)
+    model = load_efficientnet_v2_l(device=device)
     image = decode_image_b64(image_b64).to(device)
     prediction = predict_label(model=model, image_chw=image)
     print(f"  model_prediction={prediction}")

@@ -39,28 +39,27 @@ def _env_first(names: tuple[str, ...], default: str) -> str:
 
 # Shared subnet identity/constants.
 SUBNET_NAMESPACE = "perturb"
-MODEL_NAME = "EfficientNetV2-M"
+MODEL_NAME = "EfficientNetV2-L"
 PROMPTS = (
-    "dog",
-    "cat",
-    "bird",
-    "fish",
-    "reptile",
-    "amphibian",
-    "insect",
-    "arachnid",
-    "crustacean",
-    "mollusk",
-    "primate",
-    "rodent",
-    "rabbit",
-    "equine",
-    "bovine",
-    "ovine",
-    "caprine",
-    "porcine",
-    "ungulate",
-    "marine_mammal",
+    # ── Animals ──────────────────────────────────────────
+    "dog", "cat", "bird", "fish", "snake", "frog", "butterfly",
+    "spider", "crab", "jellyfish", "monkey", "hamster", "rabbit",
+    "horse", "cow", "sheep", "elephant", "lion", "tiger", "bear",
+    # ── Vehicles ──────────────────────────────────────────
+    "sports car", "truck", "bus", "motorcycle", "bicycle", "airplane",
+    "helicopter", "sailboat", "canoe", "train",
+    # ── Food ──────────────────────────────────────────────
+    "banana", "strawberry", "orange", "broccoli", "mushroom", "pizza",
+    "cheeseburger", "ice cream", "coffee mug", "wine bottle",
+    # ── Everyday Objects ──────────────────────────────────
+    "chair", "lamp", "clock", "backpack", "umbrella", "sunglasses",
+    "shoe", "hat", "vase", "television",
+    # ── Electronics & Instruments ─────────────────────────
+    "keyboard", "mouse", "camera", "guitar", "drum", "violin",
+    "telescope", "microscope",
+    # ── Sports & Recreation ───────────────────────────────
+    "soccer ball", "basketball", "tennis ball", "baseball bat",
+    "skateboard", "surfboard", "parachute",
 )
 
 # Validator runtime state files.
@@ -75,7 +74,7 @@ PEXELS_PER_PAGE = _env_int("PERTURB_PEXELS_PER_PAGE", 40)
 PEXELS_PAGE_SPAN = _env_int("PERTURB_PEXELS_PAGE_SPAN", 10)
 PEXELS_IMAGE_VARIANT = os.getenv("PERTURB_PEXELS_IMAGE_VARIANT", "medium")
 IMAGE_SIZE = _env_int("PERTURB_IMAGE_SIZE", 64)
-TIMEOUT_SECONDS = _env_int("PERTURB_TIMEOUT_SECONDS", 10)
+TIMEOUT_SECONDS = _env_int("PERTURB_TIMEOUT_SECONDS", 15)
 QUERY_INTERVAL_SECONDS = _env_int("PERTURB_QUERY_INTERVAL_SECONDS", 120)
 K_MINERS = _env_int("PERTURB_K_MINERS", 100)
 HISTORY_SIZE = _env_int("PERTURB_HISTORY_SIZE", 50)

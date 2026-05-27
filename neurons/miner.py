@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from perturbnet.image_io import decode_image_b64, encode_image_b64
-from perturbnet.model import load_efficientnet_v2_m, logits_for_images, predict_index, resolve_target_index
+from perturbnet.model import load_efficientnet_v2_l, logits_for_images, predict_index, resolve_target_index
 from perturbnet.protocol import AttackChallenge
 
 logger = pylogging.getLogger(__name__)
@@ -95,7 +95,7 @@ class PerturbMiner:
         self.metagraph = self._init_metagraph_with_retry()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.model = load_efficientnet_v2_m(self.device)
+        self.model = load_efficientnet_v2_l(self.device)
 
         self.axon = _make_axon(wallet=self.wallet, config=self.config)
         self.axon.attach(

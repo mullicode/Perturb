@@ -29,7 +29,7 @@ Use this before long validator uptime tests or mainnet deployment.
 - [ ] Check output reports:
   - llm_endpoint health success
   - semantic sanity checks pass
-  - EfficientNetV2-M prediction succeeds
+  - EfficientNetV2-L prediction succeeds
   - challenge semantic verification passes
   - validator logs include `ssim` and `psnr_db` for scored responses
 
