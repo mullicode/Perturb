@@ -3,17 +3,71 @@ import logging as pylogging
 import os
 import time
 import typing
+import math
+import asyncio
 
 import bittensor as bt
 import torch
 import torch.nn.functional as F
 
 from perturbnet.image_io import decode_image_b64, encode_image_b64
-from perturbnet.model import load_efficientnet_v2_l, logits_for_images, predict_index, resolve_target_index
+from perturbnet.model import (
+    _preprocess_for_efficientnet_v2_l,
+    load_efficientnet_v2_l,
+    resolve_target_index,
+)
 from perturbnet.protocol import AttackChallenge
 
 logger = pylogging.getLogger(__name__)
 
+# ── Validator acceptance window ─────────────────────────────────────────────
+# These MUST mirror neurons/validator.py::verify_and_score + the canonical
+# perturbnet/constants.py defaults. They are VALIDITY gates (what the validator
+# will actually accept). The validator's L-inf window is [min_linf, min(epsilon,
+# max_linf)] = [0.003, 0.03] for the sampled epsilon range [0.06, 0.20], and it
+# never rejects on RMSE (RMSE only affects the score).
+_VAL_MIN_LINF      = float(os.getenv("MINER_VAL_MIN_LINF",    "0.003"))
+_VAL_MAX_LINF      = float(os.getenv("MINER_VAL_MAX_LINF",    "0.00393"))
+_VAL_MIN_SSIM      = float(os.getenv("MINER_VAL_MIN_SSIM",    "0.98"))
+_VAL_MIN_PSNR_DB   = float(os.getenv("MINER_VAL_MIN_PSNR_DB", "38.0"))
+
+# ── Flip-robustness margin ──────────────────────────────────────────────────
+# A flip is only accepted when the true label sits at least this many logits
+# BELOW the winning class. A pure argmax flip (margin ≈ 0) is a boundary flip
+# that does not survive the small numerical differences between this miner's
+# inference path and the validator's (TF32 conv, cuDNN algo choice, device,
+# bicubic-resize numerics) — the validator then re-classifies it as the
+# original label (reason=label_match_with_original, score=0).
+_FLIP_MARGIN_EPS   = float(os.getenv("MINER_FLIP_MARGIN_EPS", "0.4"))
+# Match the validator's numerics by disabling TF32 reductions on the miner so
+# a locally-confirmed flip reflects what the validator will actually compute.
+_DISABLE_TF32      = os.getenv("MINER_DISABLE_TF32", "1").strip() not in ("0", "false", "no")
+if _DISABLE_TF32:
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Model forward helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _model_logits_batch(model: torch.nn.Module, x_in: torch.Tensor) -> torch.Tensor:
+    x_prep = _preprocess_for_efficientnet_v2_l(x_in)
+    return model(x_prep)
+
+
+def _pred_index(model: torch.nn.Module, image_chw: torch.Tensor) -> int:
+    with torch.inference_mode():
+        logits = _model_logits_batch(model, image_chw.unsqueeze(0).float())
+        return int(logits.argmax(dim=1)[0].item())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Bittensor plumbing
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _make_wallet(config):
     wallet_name = getattr(config.wallet, "name", getattr(config, "wallet_name", "default"))
@@ -59,20 +113,41 @@ def _make_subtensor(config):
         return subtensor_cls(config=config)
 
 
-def _make_axon(wallet, config):
-    resolved_config = config() if callable(config) else config
-    if hasattr(bt, "axon"):
-        try:
-            return bt.axon(wallet=wallet, config=resolved_config)
-        except Exception:
-            return bt.axon(wallet=wallet)
-    axon_cls = getattr(bt, "Axon", None)
+def _make_axon(wallet, config) -> typing.Any:
+    axon_cfg = getattr(config, "axon", None)
+    port     = int(
+        getattr(axon_cfg, "port", None)
+        or getattr(config, "axon_port", None)
+        or os.getenv("MINER_PORT", os.getenv("AXON_PORT", "9000"))
+    )
+    ip = str(
+        getattr(axon_cfg, "ip", None) or os.getenv("MINER_IP", os.getenv("AXON_IP", "0.0.0.0"))
+    ).strip() or "0.0.0.0"
+    external_ip = str(
+        getattr(axon_cfg, "external_ip", None) or os.getenv("MINER_EXTERNAL_IP", "")
+    ).strip()
+    external_port_raw = (
+        getattr(axon_cfg, "external_port", None) or os.getenv("MINER_EXTERNAL_PORT", "")
+    )
+    external_port = int(str(external_port_raw).strip()) if str(external_port_raw).strip() else port
+    if not external_ip:
+        raise RuntimeError(
+            "MINER_EXTERNAL_IP is not set. "
+            "Set it to the public IP address that validators can reach this miner on."
+        )
+    max_workers = int(getattr(axon_cfg, "max_workers", None) or os.getenv("AXON_MAX_WORKERS", "10"))
+    axon_cls    = getattr(bt, "Axon", None)
     if axon_cls is None:
-        raise RuntimeError("No axon constructor found in bittensor.")
-    try:
-        return axon_cls(wallet=wallet, config=resolved_config)
-    except Exception:
-        return axon_cls(wallet=wallet)
+        raise RuntimeError("bittensor.Axon class not found.")
+    logger.info(
+        f"[MINER] Creating axon ip={ip} port={port} "
+        f"external_ip={external_ip} external_port={external_port} max_workers={max_workers}"
+    )
+    return axon_cls(
+        wallet=wallet, ip=ip, port=port,
+        external_ip=external_ip, external_port=external_port,
+        max_workers=max_workers,
+    )
 
 
 def _configure_log_level(level_raw: str) -> None:
@@ -85,6 +160,156 @@ def _configure_log_level(level_raw: str) -> None:
     )
     pylogging.getLogger().setLevel(level)
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Quality / preflight / PNG submit
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _AdvQuality(typing.NamedTuple):
+    norm:       float
+    rmse:       float
+    ssim:       float
+    psnr_db:    float
+    pred:       int
+    target_hit: bool
+    flipped:    bool
+    # logits[true] - max_{j != true} logits[j].  < 0 ⇒ argmax flipped;
+    # <= -_FLIP_MARGIN_EPS ⇒ robust (transferable) flip.
+    margin:     float = 0.0
+
+
+class _PreflightResult(typing.NamedTuple):
+    ok:      bool
+    reason:  str
+    quality: _AdvQuality
+
+
+def _compute_ssim(x_clean: torch.Tensor, x_adv: torch.Tensor, kernel_size: int = 11) -> float:
+    if x_clean.ndim != 3 or x_adv.ndim != 3 or x_clean.shape != x_adv.shape:
+        return 0.0
+    padding = kernel_size // 2
+    x, y    = x_clean.unsqueeze(0), x_adv.unsqueeze(0)
+    c1, c2  = 0.01 ** 2, 0.03 ** 2
+    mu_x    = F.avg_pool2d(x, kernel_size=kernel_size, stride=1, padding=padding)
+    mu_y    = F.avg_pool2d(y, kernel_size=kernel_size, stride=1, padding=padding)
+    sigma_x  = F.avg_pool2d(x * x, kernel_size=kernel_size, stride=1, padding=padding) - mu_x * mu_x
+    sigma_y  = F.avg_pool2d(y * y, kernel_size=kernel_size, stride=1, padding=padding) - mu_y * mu_y
+    sigma_xy = F.avg_pool2d(x * y, kernel_size=kernel_size, stride=1, padding=padding) - mu_x * mu_y
+    numerator   = (2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)
+    denominator = (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x + sigma_y + c2)
+    return float((numerator / (denominator + 1e-12)).mean().item())
+
+
+def _compute_psnr_db(x_clean: torch.Tensor, x_adv: torch.Tensor) -> float:
+    mse = float(torch.mean((x_adv - x_clean) ** 2).item())
+    if mse <= 1e-12:
+        return 99.0
+    return 10.0 * math.log10(1.0 / mse)
+
+
+def _measure_adv_quality(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    adv: torch.Tensor,
+    true_label: int,
+    target_label: int,
+) -> _AdvQuality:
+    diff = adv - clean
+    norm = float(diff.abs().max().item())
+    rmse = float(torch.sqrt(torch.mean(diff ** 2)).item())
+    tl = int(true_label)
+    with torch.inference_mode():
+        logits = _model_logits_batch(model, adv.unsqueeze(0).float()).squeeze(0).float()
+    pred = int(logits.argmax().item())
+    # margin = logits[true] - best competing logit.  A robust flip needs the
+    # true label to sit at least _FLIP_MARGIN_EPS below the winner, otherwise
+    # the boundary flip will not transfer to the validator's inference path.
+    competitor = logits.clone()
+    competitor[tl] = float("-inf")
+    margin = float(logits[tl].item() - competitor.max().item())
+    robust_flip = (pred != tl) and (margin <= -_FLIP_MARGIN_EPS)
+    return _AdvQuality(
+        norm=norm, rmse=rmse,
+        ssim=_compute_ssim(clean, adv), psnr_db=_compute_psnr_db(clean, adv),
+        pred=pred, target_hit=pred == int(target_label), flipped=robust_flip,
+        margin=margin,
+    )
+
+
+def _encode_decode_roundtrip(adv: torch.Tensor) -> torch.Tensor:
+    """Single PNG encode then decode — matches exactly what validator does."""
+    return decode_image_b64(encode_image_b64(adv)).to(adv.device)
+
+
+def _quality_on_png(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    adv: torch.Tensor,
+    true_label: int,
+    target_label: int,
+) -> typing.Tuple[torch.Tensor, _AdvQuality]:
+    """Measure quality against the original clean image via one PNG roundtrip."""
+    decoded = _encode_decode_roundtrip(adv)
+    q = _measure_adv_quality(model, clean, decoded, true_label, target_label)
+    return decoded, q
+
+
+def _preflight_flip_only(
+    quality: _AdvQuality,
+    true_label: int,
+    epsilon: float,
+) -> _PreflightResult:
+    tl = int(true_label)
+    # Mirror neurons/validator.py::verify_and_score acceptance gates exactly.
+    # norm/rmse/ssim/psnr are already measured the same way the validator
+    # measures them (both clean and adv decoded from PNG), so these checks
+    # predict the validator outcome faithfully. The validator's L-inf ceiling
+    # is min(epsilon, max_linf_delta) — NOT the miner's 1/255 optimization
+    # target — and it has no RMSE rejection.
+    eff_max = min(float(epsilon), _VAL_MAX_LINF)
+    if quality.pred == tl:
+        return _PreflightResult(False, "label_match_with_original", quality)
+    if quality.norm < _VAL_MIN_LINF:
+        return _PreflightResult(False, "below_min_delta", quality)
+    if quality.norm > eff_max:
+        return _PreflightResult(False, "above_max_delta", quality)
+    if quality.ssim < _VAL_MIN_SSIM:
+        return _PreflightResult(False, "below_min_ssim", quality)
+    if _VAL_MIN_PSNR_DB > 0.0 and quality.psnr_db < _VAL_MIN_PSNR_DB:
+        return _PreflightResult(False, "below_min_psnr_db", quality)
+    return _PreflightResult(True, "ok_flip", quality)
+
+
+def _finalize_perturbed_image(
+    model: torch.nn.Module,
+    clean: torch.Tensor,
+    adv: torch.Tensor,
+    true_label: int,
+    epsilon: float,
+) -> typing.Tuple[torch.Tensor, _AdvQuality, bool, str, int]:
+    """Run preflight checks and final encode/decode verification on a candidate image."""
+    decoded_adv, quality = _quality_on_png(model, clean, adv, true_label, true_label)
+    preflight = _preflight_flip_only(quality, true_label, epsilon)
+
+    encoded_b64 = encode_image_b64(decoded_adv)
+    decoded_final = decode_image_b64(encoded_b64).to(clean.device)
+    pred_final = _pred_index(model, decoded_final)
+
+    if pred_final == true_label:
+        logger.warning(
+            f"[SUBMIT] FLIP LOST after final encode/decode! "
+            f"pred={pred_final} true={true_label} — submitting anyway"
+        )
+    else:
+        logger.info(
+            f"[SUBMIT] encode/decode flip confirmed pred={pred_final} true={true_label}"
+        )
+
+    return decoded_adv, quality, preflight.ok, preflight.reason, pred_final
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Miner
+# ═══════════════════════════════════════════════════════════════════════════
 
 class PerturbMiner:
     def __init__(self, config: typing.Any) -> None:
@@ -96,6 +321,9 @@ class PerturbMiner:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = load_efficientnet_v2_l(self.device)
+
+        self._in_flight: dict[str, asyncio.Future] = {}
+        self._in_flight_lock = asyncio.Lock()
 
         self.axon = _make_axon(wallet=self.wallet, config=self.config)
         self.axon.attach(
@@ -156,49 +384,62 @@ class PerturbMiner:
             synapse.perturbed_image_b64 = synapse.clean_image_b64
             return synapse
 
+        task_id = getattr(synapse, "task_id", "unknown")
         clean = decode_image_b64(synapse.clean_image_b64).to(self.device)
-        target_index = resolve_target_index(synapse.true_label)
-        if target_index is None:
+        true_label = resolve_target_index(synapse.true_label)
+        if true_label is None:
             logger.warning(
-                f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unresolved true_label={getattr(synapse, 'true_label', None)}"
+                f"Skipping task={task_id}: unresolved true_label={getattr(synapse, 'true_label', None)}"
             )
             synapse.perturbed_image_b64 = synapse.clean_image_b64
             return synapse
 
         epsilon = float(synapse.epsilon)
-        min_delta = float(getattr(synapse, "min_delta", 0.002))
-
-        # Basic default algorithm: small-step untargeted PGD.
-        steps = 10
-        step_size = max(epsilon / 4.0, 1.0 / 255.0)
-        adv = clean.clone().detach()
-        best = adv.clone()
-        best_delta = 0.0
-        final_pred = target_index
-        for _ in range(steps):
-            adv.requires_grad_(True)
-            logits = logits_for_images(model=self.model, image_bchw=adv.unsqueeze(0))
-            loss = F.cross_entropy(logits, torch.tensor([target_index], device=self.device))
-            grad = torch.autograd.grad(loss, adv)[0]
-            adv = adv.detach() + step_size * grad.sign()
-            adv = torch.max(torch.min(adv, clean + epsilon), clean - epsilon).clamp(0.0, 1.0)
-
-            pred = predict_index(model=self.model, image_chw=adv)
-            final_pred = pred
-            delta = float((adv - clean).abs().max().item())
-            if delta > best_delta:
-                best = adv.clone()
-                best_delta = delta
-            if pred != target_index and delta >= min_delta:
-                best = adv.clone()
-                break
-
-        adv = best
-        synapse.perturbed_image_b64 = encode_image_b64(adv)
+        t0 = time.perf_counter()
+        c, h, w = clean.shape
         logger.info(
-            f"Finished task={getattr(synapse, 'task_id', 'unknown')} target_idx={target_index} "
-            f"final_pred={final_pred} best_delta={best_delta:.6f} min_delta={min_delta:.6f}"
+            f"[FORWARD] task_eps={epsilon:.4f} res={c}x{h}x{w} "
+            f"val_linf=[{_VAL_MIN_LINF:.4f},{min(epsilon, _VAL_MAX_LINF):.4f}]"
         )
+
+        loop = asyncio.get_event_loop()
+        adv = clean
+        (
+            decoded_adv,
+            quality,
+            preflight_ok,
+            preflight_reason,
+            pred_final,
+        ) = await loop.run_in_executor(
+            None,
+            lambda: _finalize_perturbed_image(
+                model=self.model,
+                clean=clean,
+                adv=adv,
+                true_label=true_label,
+                epsilon=epsilon,
+            ),
+        )
+
+        t_enc0 = time.perf_counter()
+        synapse.perturbed_image_b64 = encode_image_b64(decoded_adv)
+        encode_ms = (time.perf_counter() - t_enc0) * 1000.0
+
+        logger.info(
+            f"Finished task={task_id} "
+            f"true={true_label} pred={quality.pred} "
+            f"flip={quality.flipped} l_inf={quality.norm:.5f} rmse={quality.rmse:.2e} "
+            f"ssim={quality.ssim:.4f} psnr={quality.psnr_db:.2f} "
+            f"preflight={preflight_ok} reason={preflight_reason} "
+            f"final_pred={pred_final} "
+            f"encode_ms={encode_ms:.1f} "
+            f"total_ms={(time.perf_counter() - t0) * 1000:.1f}"
+        )
+
+        del adv, clean, decoded_adv
+        if os.getenv("MINER_CUDA_EMPTY_CACHE", "0").strip() == "1":
+            torch.cuda.empty_cache()
+
         return synapse
 
     async def blacklist(self, synapse: AttackChallenge) -> typing.Tuple[bool, str]:
