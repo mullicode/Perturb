@@ -427,10 +427,10 @@ class PerturbMiner:
             grad_t_raw = x.grad.detach().reshape(-1).clone()
  
             # Boundary gradient for this target
-            g_t     = grad_true - grad_t_raw
+            g_t = grad_true - grad_t_raw
             margin_t = (true_logit - lg[t]).item()
-            g_norm2  = g_t.norm(2).item()
-            g_norm1  = g_t.abs().sum().item()
+            g_norm2 = g_t.norm(2).item()
+            g_norm1 = g_t.abs().sum().item()
  
             if g_norm2 < 1e-10:
                 continue
@@ -442,9 +442,9 @@ class PerturbMiner:
             estimated_rmse = margin_t / (g_norm2 * (N ** 0.5))
  
             # Estimated pixel count using top-1% gradient mean
-            n_top    = max(100, int(N * 0.01))
+            n_top = max(100, int(N * 0.01))
             top_mean = g_t.abs().topk(n_top).values.mean().item()
-            k_est    = int(margin_t / max(eps * top_mean, 1e-10))
+            k_est = int(margin_t / max(eps * top_mean, 1e-10))
  
             targets.append({
                 "target":         t,
@@ -460,26 +460,26 @@ class PerturbMiner:
  
         targets.sort(key=lambda c: c["estimated_rmse"])
         best_target = targets[0]
-        target_t    = best_target["target"]
-        k_est       = best_target["k_estimated"]
+        target_idx = best_target["target"]
+        k_est = best_target["k_estimated"]
         logger.info(
-            f"[TARGET] best={target_t} "
+            f"[TARGET] best={target_idx} "
             f"est_rmse={best_target['estimated_rmse']:.2e} "
             f"k_est={k_est}"
         )
  
         # ── Phase 2: pixel ranking ─────────────────────────────────────────
-        g_t   = best_target["gradient"]
-        signs = -g_t.sign()
+        g_tgt = best_target["gradient"]
+        signs = -g_tgt.sign()
         signs[signs == 0] = 1.0
  
         # grad × input: SE-aware pixel importance score
-        scores = (g_t * clean.reshape(-1)).abs()
+        scores = (g_tgt * clean.reshape(-1)).abs()
  
         # valid_dir: only pixels where the gradient-required direction
         # is actually achievable after uint8 clipping
-        flat  = clean.reshape(-1)
-        q_flat = (flat * 255.0).round()
+        flat_clean = clean.reshape(-1)
+        q_flat = (flat_clean * 255.0).round()
         valid_dir = (
             ((signs > 0) & (q_flat < 255)) |
             ((signs < 0) & (q_flat > 0))
@@ -487,26 +487,26 @@ class PerturbMiner:
         scores[~valid_dir] = 0.0
  
         # ── Phase 3: adaptive greedy ───────────────────────────────────────
-        current_adv   = clean.clone()
-        selected      = []                                        # pixel indices
+        current_adv = clean.clone()
+        selected = []                                        # pixel indices
         selected_mask = torch.zeros(N, dtype=torch.bool, device=self.device)
-        best_result   = None
-        gap_initial   = gap
+        best_result = None
+        gap_initial = gap
  
         def check_flip(adv_float):
             """Verify flip on uint8-roundtripped image."""
             snapped = (adv_float * 255.0).round().clamp(0, 255) / 255.0
             with torch.no_grad():
-                lg_s   = logits_for_images(
+                lg_s = logits_for_images(
                     self.model, snapped.unsqueeze(0)
                 ).squeeze(0)
-                pred   = int(lg_s.argmax().item())
+                pred = int(lg_s.argmax().item())
                 margin = (lg_s[true_idx] - lg_s.topk(2).values[1]).item()
             return pred != true_idx, margin, snapped
  
         def get_batch(k_cur, cur_gap):
             """Adaptive batch size from progress and current confidence."""
-            progress  = k_cur / max(k_est, 1)
+            progress = k_cur / max(k_est, 1)
             gap_ratio = cur_gap / max(gap_initial, 1e-8)
             if progress < 0.03:          # first 3%: exact, batch=1
                 return 1
@@ -522,7 +522,7 @@ class PerturbMiner:
                 break
  
             # Gradient refresh at current adversarial state
-            x_in  = current_adv.detach().requires_grad_(True)
+            x_in = current_adv.detach().requires_grad_(True)
             lg_in = logits_for_images(
                 self.model, x_in.unsqueeze(0)
             ).squeeze(0)
@@ -534,7 +534,7 @@ class PerturbMiner:
  
             if x_in.grad is not None:
                 x_in.grad.zero_()
-            lg_in[target_t].backward()
+            lg_in[target_idx].backward()
             g_tgt_cur = x_in.grad.detach().reshape(-1).clone()
  
             g_cur = g_true_cur - g_tgt_cur
@@ -545,15 +545,15 @@ class PerturbMiner:
                 ).item()
  
             # Scores for this step
-            flat_cur   = current_adv.reshape(-1)
-            sc         = (g_cur * flat_cur).abs()
+            flat_cur = current_adv.reshape(-1)
+            sc = (g_cur * flat_cur).abs()
             sc[selected_mask] = 0.0
  
             # Direction validity at current state
-            q_cur      = (flat_cur * 255.0).round()
-            signs_cur  = -g_cur.sign()
+            q_cur = (flat_cur * 255.0).round()
+            signs_cur = -g_cur.sign()
             signs_cur[signs_cur == 0] = 1.0
-            valid_cur  = (
+            valid_cur = (
                 ((signs_cur > 0) & (q_cur < 255)) |
                 ((signs_cur < 0) & (q_cur > 0))
             )
@@ -562,8 +562,8 @@ class PerturbMiner:
             if sc.max() <= 0:
                 break
  
-            b      = get_batch(len(selected), cur_gap)
-            n_pick = min(b, int(valid_cur.sum().item()))
+            batch_size = get_batch(len(selected), cur_gap)
+            n_pick = min(batch_size, int(valid_cur.sum().item()))
             if n_pick == 0:
                 break
  
@@ -571,10 +571,10 @@ class PerturbMiner:
  
             # Apply perturbation in uint8 integer space
             # Avoids floating point drift that causes roundtrip failures
-            adv_u8  = (current_adv * 255.0).round().clamp(0, 255)
+            adv_u8 = (current_adv * 255.0).round().clamp(0, 255)
             flat_u8 = adv_u8.reshape(-1)
             for idx in top_idx.tolist():
-                s          = int(signs_cur[idx].item())
+                s = int(signs_cur[idx].item())
                 flat_u8[idx] = (flat_u8[idx] + s).clamp(0, 255)
                 selected.append(idx)
                 selected_mask[idx] = True
@@ -607,16 +607,16 @@ class PerturbMiner:
             return None
  
         # ── Phase 4: backward elimination ─────────────────────────────────
-        elim_budget  = min(1.2, deadline - time.perf_counter() - 0.3)
+        elim_budget = min(1.2, deadline - time.perf_counter() - 0.3)
         elim_deadline = time.perf_counter() + elim_budget
  
-        sel  = best_result["selected"].copy()
+        sel = best_result["selected"].copy()
         curr = best_result["image"].clone()
  
         def still_flips(adv_float):
             sn = (adv_float * 255.0).round().clamp(0, 255) / 255.0
             with torch.no_grad():
-                lg2  = logits_for_images(
+                lg2 = logits_for_images(
                     self.model, sn.unsqueeze(0)
                 ).squeeze(0)
                 marg = (lg2[true_idx] - lg2.topk(2).values[1]).item()
@@ -624,7 +624,7 @@ class PerturbMiner:
  
         def apply_sel(sel_list):
             """Rebuild adversarial image from selection list."""
-            base    = (clean * 255.0).round().clamp(0, 255)
+            base = (clean * 255.0).round().clamp(0, 255)
             flat_b  = base.reshape(-1)
             for px in sel_list:
                 s = int(signs[px].item())
@@ -636,12 +636,12 @@ class PerturbMiner:
             improved = False
  
             # Rank pixels by weakest gradient contribution — try removing first
-            x_e  = curr.detach().requires_grad_(True)
+            x_e = curr.detach().requires_grad_(True)
             lg_e = logits_for_images(
                 self.model, x_e.unsqueeze(0)
             ).squeeze(0)
             lg_e[true_idx].backward()
-            g_e   = x_e.grad.detach().reshape(-1).abs()
+            g_e = x_e.grad.detach().reshape(-1).abs()
             order = sorted(
                 range(len(sel)),
                 key=lambda i: g_e[sel[i]].item()
