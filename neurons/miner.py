@@ -384,15 +384,8 @@ class PerturbMiner:
         Full pipeline. Returns dict with image/k/rmse/norm/margin/pred
         or None if no flip found.
         """
-        # ── Phase 0: Setup ────────────────────────────────────
         C, H, W = clean.shape
         N = C * H * W
-
-        # uint8 integer values for valid moves
-        q = (clean * 255.0).round()           # float 0-255
-        valid_plus  = (q <= 254).reshape(-1)  # can add 1/255
-        valid_minus = (q >= 1).reshape(-1)    # can subtract 1/255
-        alive       = valid_plus | valid_minus
 
         # ── Phase 1: Model probe ──────────────────────────────
         x = clean.detach().requires_grad_(True)
@@ -408,24 +401,23 @@ class PerturbMiner:
             )
 
         true_logit = lg[true_idx]
-        gap        = (true_logit - lg.topk(2).values[1]).item()
-
+        gap = (true_logit - lg.topk(2).values[1]).item()
         logger.info(f"[PROBE] true={true_idx} gap={gap:.3f} N={N}")
-
-        # ── Phase 2: Target ranking ───────────────────────────
-        # top-20 classes by logit, ranked by estimated_rmse
+ 
+        # Top-20 candidate target classes by logit (excluding true class)
         top_classes = lg.detach().argsort(descending=True)
         top_classes = [
             c.item() for c in top_classes
             if c.item() != true_idx
         ][:20]
-
-        # Compute true label gradient once
+ 
+        # Compute true-label gradient once, reuse across all target rankings
         if x.grad is not None:
             x.grad.zero_()
         true_logit.backward(retain_graph=True)
         grad_true = x.grad.detach().reshape(-1).clone()
-
+ 
+        # Rank targets by estimated_rmse = margin / (||g_t||2 × sqrt(N))
         targets = []
         for i, t in enumerate(top_classes):
             if x.grad is not None:
@@ -433,27 +425,27 @@ class PerturbMiner:
             retain = (i < len(top_classes) - 1)
             lg[t].backward(retain_graph=retain)
             grad_t_raw = x.grad.detach().reshape(-1).clone()
-
-            g_t = grad_true - grad_t_raw
-            g_t[~alive] = 0.0
-
+ 
+            # Boundary gradient for this target
+            g_t     = grad_true - grad_t_raw
             margin_t = (true_logit - lg[t]).item()
             g_norm2  = g_t.norm(2).item()
             g_norm1  = g_t.abs().sum().item()
-
+ 
             if g_norm2 < 1e-10:
                 continue
-
-            feasibility = eps * g_norm1
-            if feasibility < margin_t * 0.1:
+ 
+            # Feasibility: can 1/255 perturbations reach this boundary?
+            if (eps * g_norm1) < margin_t * 0.1:
                 continue
-
+ 
             estimated_rmse = margin_t / (g_norm2 * (N ** 0.5))
-
-            n_top    = max(100, int(g_t.numel() * 0.01))
+ 
+            # Estimated pixel count using top-1% gradient mean
+            n_top    = max(100, int(N * 0.01))
             top_mean = g_t.abs().topk(n_top).values.mean().item()
             k_est    = int(margin_t / max(eps * top_mean, 1e-10))
-
+ 
             targets.append({
                 "target":         t,
                 "margin":         margin_t,
@@ -461,224 +453,224 @@ class PerturbMiner:
                 "k_estimated":    k_est,
                 "gradient":       g_t,
             })
-
+ 
         if not targets:
-            logger.warning("No feasible targets found")
+            logger.warning("[ATTACK] No feasible targets found")
             return None
-
+ 
         targets.sort(key=lambda c: c["estimated_rmse"])
         best_target = targets[0]
+        target_t    = best_target["target"]
+        k_est       = best_target["k_estimated"]
         logger.info(
-            f"[TARGET] best={best_target['target']} "
+            f"[TARGET] best={target_t} "
             f"est_rmse={best_target['estimated_rmse']:.2e} "
-            f"k_est={best_target['k_estimated']}"
+            f"k_est={k_est}"
         )
-
-        # ── Phase 3: Pixel ranking ────────────────────────────
-        g_t    = best_target["gradient"]
-        signs  = -g_t.sign()
+ 
+        # ── Phase 2: pixel ranking ─────────────────────────────────────────
+        g_t   = best_target["gradient"]
+        signs = -g_t.sign()
         signs[signs == 0] = 1.0
-
-        # Scores: grad × input (SE-aware)
+ 
+        # grad × input: SE-aware pixel importance score
         scores = (g_t * clean.reshape(-1)).abs()
-        scores[~alive] = 0.0
-
-        # Valid direction check
-        flat = clean.reshape(-1)
-        q_flat = (flat * 255).round()
+ 
+        # valid_dir: only pixels where the gradient-required direction
+        # is actually achievable after uint8 clipping
+        flat  = clean.reshape(-1)
+        q_flat = (flat * 255.0).round()
         valid_dir = (
             ((signs > 0) & (q_flat < 255)) |
             ((signs < 0) & (q_flat > 0))
         )
         scores[~valid_dir] = 0.0
-
-        sorted_idx   = torch.argsort(scores, descending=True)
-        sorted_signs = signs[sorted_idx]
-
-        # ── Phase 4: Adaptive greedy attack ───────────────────
-        k_est     = best_target["k_estimated"]
-        target_t  = best_target["target"]
-
+ 
+        # ── Phase 3: adaptive greedy ───────────────────────────────────────
         current_adv   = clean.clone()
-        selected      = []
+        selected      = []                                        # pixel indices
         selected_mask = torch.zeros(N, dtype=torch.bool, device=self.device)
         best_result   = None
         gap_initial   = gap
-
+ 
         def check_flip(adv_float):
-            # Always verify on uint8 roundtrip
-            snapped = (adv_float * 255).round().clamp(0, 255) / 255.0
+            """Verify flip on uint8-roundtripped image."""
+            snapped = (adv_float * 255.0).round().clamp(0, 255) / 255.0
             with torch.no_grad():
-                lg_s = logits_for_images(
+                lg_s   = logits_for_images(
                     self.model, snapped.unsqueeze(0)
                 ).squeeze(0)
-                pred    = int(lg_s.argmax().item())
-                margin  = (
-                    lg_s[true_idx] - lg_s.topk(2).values[1]
-                ).item()
+                pred   = int(lg_s.argmax().item())
+                margin = (lg_s[true_idx] - lg_s.topk(2).values[1]).item()
             return pred != true_idx, margin, snapped
-
-        def batch_size(k_cur, cur_gap):
+ 
+        def get_batch(k_cur, cur_gap):
+            """Adaptive batch size from progress and current confidence."""
             progress  = k_cur / max(k_est, 1)
             gap_ratio = cur_gap / max(gap_initial, 1e-8)
-            if progress < 0.03:
+            if progress < 0.03:          # first 3%: exact, batch=1
                 return 1
-            if progress > 0.80:
+            if progress > 0.80:          # last 20%: near boundary, tiny batch
                 return max(1, min(5, int(gap_ratio * 10)))
             base = (200 if gap_ratio > 0.7 else
                     100 if gap_ratio > 0.4 else
-                    30 if gap_ratio > 0.2 else 10)
+                     30 if gap_ratio > 0.2 else 10)
             return max(5, int(base * (1.0 - progress)))
-
+ 
         while len(selected) < int(k_est * 1.5):
             if time.perf_counter() > deadline - 1.5:
                 break
-
-            # Gradient refresh
-            x_in = current_adv.detach().requires_grad_(True)
+ 
+            # Gradient refresh at current adversarial state
+            x_in  = current_adv.detach().requires_grad_(True)
             lg_in = logits_for_images(
                 self.model, x_in.unsqueeze(0)
             ).squeeze(0)
-
+ 
             if x_in.grad is not None:
                 x_in.grad.zero_()
             lg_in[true_idx].backward(retain_graph=True)
             g_true_cur = x_in.grad.detach().reshape(-1).clone()
-
+ 
             if x_in.grad is not None:
                 x_in.grad.zero_()
             lg_in[target_t].backward()
             g_tgt_cur = x_in.grad.detach().reshape(-1).clone()
-
+ 
             g_cur = g_true_cur - g_tgt_cur
-
+ 
             with torch.no_grad():
                 cur_gap = (
                     lg_in[true_idx] - lg_in.topk(2).values[1]
                 ).item()
-
-            # Scores
-            sc = (g_cur * current_adv.reshape(-1)).abs()
+ 
+            # Scores for this step
+            flat_cur   = current_adv.reshape(-1)
+            sc         = (g_cur * flat_cur).abs()
             sc[selected_mask] = 0.0
-
-            flat_cur = current_adv.reshape(-1)
-            q_cur    = (flat_cur * 255).round()
-            signs_cur = -g_cur.sign()
+ 
+            # Direction validity at current state
+            q_cur      = (flat_cur * 255.0).round()
+            signs_cur  = -g_cur.sign()
             signs_cur[signs_cur == 0] = 1.0
-            valid_cur = (
+            valid_cur  = (
                 ((signs_cur > 0) & (q_cur < 255)) |
                 ((signs_cur < 0) & (q_cur > 0))
             )
             sc[~valid_cur] = 0.0
-
+ 
             if sc.max() <= 0:
                 break
-
-            b     = batch_size(len(selected), cur_gap)
+ 
+            b      = get_batch(len(selected), cur_gap)
             n_pick = min(b, int(valid_cur.sum().item()))
             if n_pick == 0:
                 break
-
+ 
             top_idx = torch.topk(sc, n_pick).indices
-
-            # Apply in uint8 space
-            adv_u8 = (current_adv * 255).round().clamp(0, 255)
+ 
+            # Apply perturbation in uint8 integer space
+            # Avoids floating point drift that causes roundtrip failures
+            adv_u8  = (current_adv * 255.0).round().clamp(0, 255)
             flat_u8 = adv_u8.reshape(-1)
             for idx in top_idx.tolist():
-                s = int(signs_cur[idx].item())
+                s          = int(signs_cur[idx].item())
                 flat_u8[idx] = (flat_u8[idx] + s).clamp(0, 255)
                 selected.append(idx)
                 selected_mask[idx] = True
             current_adv = flat_u8.reshape(C, H, W) / 255.0
-
-            # Flip check
+ 
+            # Flip check on uint8 roundtrip
             flipped, margin, snapped = check_flip(current_adv)
             if flipped and margin < -0.4:
                 if best_result is None or len(selected) < best_result["k"]:
+                    with torch.no_grad():
+                        pred_now = int(
+                            logits_for_images(
+                                self.model, snapped.unsqueeze(0)
+                            ).argmax().item()
+                        )
                     best_result = {
                         "image":    snapped.clone(),
                         "k":        len(selected),
                         "margin":   margin,
                         "selected": selected.copy(),
-                        "pred":     int(
-                            logits_for_images(
-                                self.model, snapped.unsqueeze(0)
-                            ).argmax().item()
-                        ),
+                        "pred":     pred_now,
                     }
-                if margin < -1.0:
+                if margin < -1.0:   # deep enough — stop early
                     break
-
+ 
         if best_result is None:
-            logger.warning(f"[ATTACK] No flip found after {len(selected)} pixels")
+            logger.warning(
+                f"[ATTACK] No flip found after {len(selected)} pixels"
+            )
             return None
-
-        # ── Phase 5: Backward elimination ─────────────────────
-        elim_deadline = time.perf_counter() + min(
-            1.2, deadline - time.perf_counter() - 0.3
-        )
+ 
+        # ── Phase 4: backward elimination ─────────────────────────────────
+        elim_budget  = min(1.2, deadline - time.perf_counter() - 0.3)
+        elim_deadline = time.perf_counter() + elim_budget
+ 
         sel  = best_result["selected"].copy()
         curr = best_result["image"].clone()
-
+ 
         def still_flips(adv_float):
-            sn = (adv_float * 255).round().clamp(0, 255) / 255.0
+            sn = (adv_float * 255.0).round().clamp(0, 255) / 255.0
             with torch.no_grad():
                 lg2  = logits_for_images(
                     self.model, sn.unsqueeze(0)
                 ).squeeze(0)
                 marg = (lg2[true_idx] - lg2.topk(2).values[1]).item()
             return lg2.argmax().item() != true_idx and marg < -0.4
-
-        def apply_selected(sel_list):
-            adv = (clean * 255).round().clamp(0, 255)
-            flat_a = adv.reshape(-1)
-            # Recompute signs from original gradient
+ 
+        def apply_sel(sel_list):
+            """Rebuild adversarial image from selection list."""
+            base    = (clean * 255.0).round().clamp(0, 255)
+            flat_b  = base.reshape(-1)
             for px in sel_list:
                 s = int(signs[px].item())
-                flat_a[px] = (flat_a[px] + s).clamp(0, 255)
-            return flat_a.reshape(C, H, W) / 255.0
-
+                flat_b[px] = (flat_b[px] + s).clamp(0, 255)
+            return flat_b.reshape(C, H, W) / 255.0
+ 
         improved = True
         while improved and time.perf_counter() < elim_deadline:
             improved = False
-            # Try removing weakest pixel first
-            x_e = curr.detach().requires_grad_(True)
+ 
+            # Rank pixels by weakest gradient contribution — try removing first
+            x_e  = curr.detach().requires_grad_(True)
             lg_e = logits_for_images(
                 self.model, x_e.unsqueeze(0)
             ).squeeze(0)
             lg_e[true_idx].backward()
-            g_e = x_e.grad.detach().reshape(-1).abs()
-
+            g_e   = x_e.grad.detach().reshape(-1).abs()
             order = sorted(
                 range(len(sel)),
                 key=lambda i: g_e[sel[i]].item()
             )
-
+ 
             for pos in order:
                 if time.perf_counter() > elim_deadline:
                     break
-                trial = sel[:pos] + sel[pos+1:]
-                trial_adv = apply_selected(trial)
+                trial     = sel[:pos] + sel[pos + 1:]
+                trial_adv = apply_sel(trial)
                 if still_flips(trial_adv):
-                    sel  = trial
-                    curr = trial_adv
+                    sel      = trial
+                    curr     = trial_adv
                     improved = True
-                    break
-
+                    break   # restart with updated gradient
+ 
         k_final = len(sel)
         rmse    = ((k_final / N) ** 0.5) / 255.0
-        norm    = eps
-
+ 
         logger.info(
             f"[FINAL] k={k_final} rmse={rmse:.2e} "
-            f"norm={norm:.4f} margin={best_result['margin']:.3f}"
+            f"norm={eps:.4f} margin={best_result['margin']:.3f}"
         )
-
+ 
         return {
             "image":  curr,
             "k":      k_final,
             "rmse":   rmse,
-            "norm":   norm,
+            "norm":   eps,
             "margin": best_result["margin"],
             "pred":   best_result["pred"],
         }
