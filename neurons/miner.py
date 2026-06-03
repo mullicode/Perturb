@@ -386,22 +386,34 @@ class PerturbMiner:
 
         task_id = getattr(synapse, "task_id", "unknown")
         clean = decode_image_b64(synapse.clean_image_b64).to(self.device)
-        true_label = resolve_target_index(synapse.true_label)
-        if true_label is None:
+        true_idx = resolve_target_index(synapse.true_label)
+        if true_idx is None:
             logger.warning(
                 f"Skipping task={task_id}: unresolved true_label={getattr(synapse, 'true_label', None)}"
             )
             synapse.perturbed_image_b64 = synapse.clean_image_b64
             return synapse
 
-        epsilon = float(synapse.epsilon)
-        t0 = time.perf_counter()
+        epsilon = 1.0/255.0
+        min_delta = float(getattr(synapse, "min_delta", 1.0/255.0))
+        budget = 13.0
+        deadline = time.perf_counter() + budget
         c, h, w = clean.shape
         logger.info(
             f"[FORWARD] task_eps={epsilon:.4f} res={c}x{h}x{w} "
             f"val_linf=[{_VAL_MIN_LINF:.4f},{min(epsilon, _VAL_MAX_LINF):.4f}]"
         )
-
+        try:
+            result = self._attack(
+                clean, true_idx, epsilon, min_delta, deadline
+            )
+        except Exception as e:
+            logger.warning(f"Attack failed with exception: {e}")
+            result = None
+        if result is None:
+            logger.warning("No flip found — returning clean image")
+            synapse.perturbed_image_b64 = synapse.clean_image_b64
+            return synapse
         loop = asyncio.get_event_loop()
         adv = clean
         (
@@ -415,19 +427,17 @@ class PerturbMiner:
             lambda: _finalize_perturbed_image(
                 model=self.model,
                 clean=clean,
-                adv=adv,
-                true_label=true_label,
+                adv=result["image"],
+                true_label=true_idx,
                 epsilon=epsilon,
             ),
         )
-
         t_enc0 = time.perf_counter()
         synapse.perturbed_image_b64 = encode_image_b64(decoded_adv)
         encode_ms = (time.perf_counter() - t_enc0) * 1000.0
-
         logger.info(
             f"Finished task={task_id} "
-            f"true={true_label} pred={quality.pred} "
+            f"true={true_idx} pred={quality.pred} "
             f"flip={quality.flipped} l_inf={quality.norm:.5f} rmse={quality.rmse:.2e} "
             f"ssim={quality.ssim:.4f} psnr={quality.psnr_db:.2f} "
             f"preflight={preflight_ok} reason={preflight_reason} "
