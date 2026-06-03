@@ -650,11 +650,11 @@ class PerturbMiner:
             for pos in order:
                 if time.perf_counter() > elim_deadline:
                     break
-                trial     = sel[:pos] + sel[pos + 1:]
+                trial = sel[:pos] + sel[pos + 1:]
                 trial_adv = apply_sel(trial)
                 if still_flips(trial_adv):
-                    sel      = trial
-                    curr     = trial_adv
+                    sel = trial
+                    curr = trial_adv
                     improved = True
                     break   # restart with updated gradient
  
