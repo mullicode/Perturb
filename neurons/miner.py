@@ -1,6 +1,8 @@
 import argparse
+import datetime
 import logging as pylogging
 import os
+import threading
 import time
 import typing
 import math
@@ -11,14 +13,157 @@ import torch
 import torch.nn.functional as F
 
 from perturbnet.image_io import decode_image_b64, encode_image_b64
+from openpyxl import Workbook, load_workbook
+
 from perturbnet.model import (
     _preprocess_for_efficientnet_v2_l,
     load_efficientnet_v2_l,
+    logits_for_images,
     resolve_target_index,
 )
 from perturbnet.protocol import AttackChallenge
+from perturbnet import constants as C
 
 logger = pylogging.getLogger(__name__)
+
+_ATTACK_EXCEL_LOCK = threading.Lock()
+_ATTACK_EXCEL_HEADERS = (
+    "timestamp",
+    "task_id",
+    "model_name",
+    "prompt",
+    "true_label",
+    "epsilon",
+    "norm_type",
+    "min_delta",
+    "resolution",
+    "prediction",
+    "progress",
+    "rmse",
+    "norm",
+    "estimated_score",
+)
+
+
+def _append_attack_excel_row(
+    excel_path: str,
+    *,
+    task_id: str,
+    model_name: str,
+    prompt: str,
+    true_label: str,
+    epsilon: float,
+    norm_type: str,
+    min_delta: float,
+    resolution: str,
+    progress: str = "",
+    prediction: typing.Optional[int] = None,
+    rmse: typing.Optional[float] = None,
+    norm: typing.Optional[float] = None,
+    estimated_score: typing.Optional[float] = None,
+) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(excel_path)) or ".", exist_ok=True)
+    row = [
+        datetime.datetime.now().isoformat(timespec="seconds"),
+        task_id,
+        model_name,
+        prompt,
+        true_label,
+        epsilon,
+        norm_type,
+        min_delta,
+        resolution,
+        "" if prediction is None else prediction,
+        progress,
+        "" if rmse is None else rmse,
+        "" if norm is None else norm,
+        "" if estimated_score is None else estimated_score,
+    ]
+    with _ATTACK_EXCEL_LOCK:
+        if os.path.isfile(excel_path):
+            wb = load_workbook(excel_path)
+            ws = wb.active
+        else:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "attack_log"
+            ws.append(list(_ATTACK_EXCEL_HEADERS))
+        ws.append(row)
+        wb.save(excel_path)
+
+
+class _AttackExcelRecorder:
+    """Accumulates attack progress and writes one Excel row per task."""
+
+    def __init__(
+        self,
+        excel_path: str,
+        *,
+        task_id: str,
+        model_name: str,
+        prompt: str,
+        true_label: str,
+        epsilon: float,
+        norm_type: str,
+        min_delta: float,
+        resolution: str,
+    ) -> None:
+        self._excel_path = excel_path
+        self._task_id = task_id
+        self._model_name = model_name
+        self._prompt = prompt
+        self._true_label = true_label
+        self._epsilon = epsilon
+        self._norm_type = norm_type
+        self._min_delta = min_delta
+        self._resolution = resolution
+        self._progress: list[str] = []
+        self._prediction: typing.Optional[int] = None
+        self._rmse: typing.Optional[float] = None
+        self._norm: typing.Optional[float] = None
+        self._estimated_score: typing.Optional[float] = None
+
+    def log(
+        self,
+        progress: str,
+        prediction: typing.Optional[int] = None,
+        rmse: typing.Optional[float] = None,
+        norm: typing.Optional[float] = None,
+        estimated_score: typing.Optional[float] = None,
+    ) -> None:
+        self._progress.append(progress)
+        if prediction is not None:
+            self._prediction = prediction
+        if rmse is not None:
+            self._rmse = rmse
+        if norm is not None:
+            self._norm = norm
+        if estimated_score is not None:
+            self._estimated_score = estimated_score
+
+    def set_resolution(self, resolution: str) -> None:
+        self._resolution = resolution
+
+    def flush(self) -> None:
+        if not self._progress:
+            return
+        _append_attack_excel_row(
+            self._excel_path,
+            task_id=self._task_id,
+            model_name=self._model_name,
+            prompt=self._prompt,
+            true_label=self._true_label,
+            epsilon=self._epsilon,
+            norm_type=self._norm_type,
+            min_delta=self._min_delta,
+            resolution=self._resolution,
+            progress=" | ".join(self._progress),
+            prediction=self._prediction,
+            rmse=self._rmse,
+            norm=self._norm,
+            estimated_score=self._estimated_score,
+        )
+
 
 # ── Validator acceptance window ─────────────────────────────────────────────
 # These MUST mirror neurons/validator.py::verify_and_score + the canonical
@@ -279,6 +424,36 @@ def _preflight_flip_only(
     return _PreflightResult(True, "ok_flip", quality)
 
 
+def _estimate_validator_score(
+    quality: _AdvQuality,
+    true_label: int,
+    epsilon: float,
+    response_time_ms: float,
+    timeout_seconds: float,
+) -> float:
+    """Mirror neurons/validator.py::verify_and_score scoring formula."""
+    preflight = _preflight_flip_only(quality, true_label, epsilon)
+    if not preflight.ok:
+        return 0.0
+
+    effective_max_delta = min(float(epsilon), _VAL_MAX_LINF)
+    denom = max(1e-12, effective_max_delta - _VAL_MIN_LINF)
+    linf_ratio = min(max((quality.norm - _VAL_MIN_LINF) / denom, 0.0), 1.0)
+    linf_score = (1.0 - linf_ratio) ** 2
+
+    rmse_ratio = min(max(quality.rmse / max(1e-12, effective_max_delta), 0.0), 1.0)
+    rmse_score = (1.0 - rmse_ratio) ** 2
+
+    total_weight = max(1e-12, C.LINF_COMPONENT_WEIGHT + C.RMSE_COMPONENT_WEIGHT)
+    perturbation_score = (
+        (C.LINF_COMPONENT_WEIGHT * linf_score) + (C.RMSE_COMPONENT_WEIGHT * rmse_score)
+    ) / total_weight
+
+    time_ratio = response_time_ms / max(1e-12, timeout_seconds * 1000.0)
+    speed_score = 1.0 - min(time_ratio, 1.0)
+    return float(C.PERTURBATION_WEIGHT * perturbation_score + C.SPEED_WEIGHT * speed_score)
+
+
 def _finalize_perturbed_image(
     model: torch.nn.Module,
     clean: torch.Tensor,
@@ -331,6 +506,10 @@ class PerturbMiner:
             blacklist_fn=self.blacklist,
             priority_fn=self.priority,
         )
+        self._attack_excel_path = os.path.join(
+            getattr(getattr(config, "logging", None), "logging_dir", "./logs"),
+            "attack_log.xlsx",
+        )
 
     def _log_step_start(self, step_name: str, **context: typing.Any) -> None:
         if context:
@@ -379,6 +558,10 @@ class PerturbMiner:
         eps: float,                  # 1/255
         min_delta: float,
         deadline: float,
+        log_attack: typing.Callable[..., None],
+        challenge_epsilon: float,
+        timeout_seconds: float,
+        attack_t0: float,
     ) -> typing.Optional[dict]:
         """
         Full pipeline. Returns dict with image/k/rmse/norm/margin/pred
@@ -403,14 +586,15 @@ class PerturbMiner:
         true_logit = lg[true_idx]
         gap = (true_logit - lg.topk(2).values[1]).item()
         logger.info(f"[PROBE] true={true_idx} gap={gap:.3f} N={N}")
- 
+        log_attack(f"[PROBE] true={true_idx} gap={gap:.3f} N={N}")
         # Top-20 candidate target classes by logit (excluding true class)
         top_classes = lg.detach().argsort(descending=True)
         top_classes = [
             c.item() for c in top_classes
             if c.item() != true_idx
         ][:20]
- 
+        logger.info(f"[TOP20CLASS] top_classes={top_classes}")
+
         # Compute true-label gradient once, reuse across all target rankings
         if x.grad is not None:
             x.grad.zero_()
@@ -456,9 +640,11 @@ class PerturbMiner:
  
         if not targets:
             logger.warning("[ATTACK] No feasible targets found")
+            log_attack("[ATTACK] No feasible targets found")
             return None
  
         targets.sort(key=lambda c: c["estimated_rmse"])
+        logger.info(f"[TARGETS] targets={targets}")
         best_target = targets[0]
         target_idx = best_target["target"]
         k_est = best_target["k_estimated"]
@@ -467,7 +653,10 @@ class PerturbMiner:
             f"est_rmse={best_target['estimated_rmse']:.2e} "
             f"k_est={k_est}"
         )
- 
+        log_attack(
+            f"[TARGET] best={target_idx} "
+            f"est_rmse={best_target['estimated_rmse']:.2e} k_est={k_est}"
+        )
         # ── Phase 2: pixel ranking ─────────────────────────────────────────
         g_tgt = best_target["gradient"]
         signs = -g_tgt.sign()
@@ -508,8 +697,9 @@ class PerturbMiner:
             """Adaptive batch size from progress and current confidence."""
             progress = k_cur / max(k_est, 1)
             gap_ratio = cur_gap / max(gap_initial, 1e-8)
+            logger.info(f"[GET_BATCH] progress={progress} gap_ratio={gap_ratio}")
             if progress < 0.03:          # first 3%: exact, batch=1
-                return 1
+                return 20
             if progress > 0.80:          # last 20%: near boundary, tiny batch
                 return max(1, min(5, int(gap_ratio * 10)))
             base = (200 if gap_ratio > 0.7 else
@@ -517,33 +707,38 @@ class PerturbMiner:
                      30 if gap_ratio > 0.2 else 10)
             return max(5, int(base * (1.0 - progress)))
  
+        REFRESH_INTERVAL = 50
+        g_cur = None
+        cur_gap = gap
+        last_refresh_count = -REFRESH_INTERVAL
         while len(selected) < int(k_est * 1.5):
             if time.perf_counter() > deadline - 1.5:
                 break
  
             # Gradient refresh at current adversarial state
-            x_in = current_adv.detach().requires_grad_(True)
-            lg_in = logits_for_images(
-                self.model, x_in.unsqueeze(0)
-            ).squeeze(0)
- 
-            if x_in.grad is not None:
-                x_in.grad.zero_()
-            lg_in[true_idx].backward(retain_graph=True)
-            g_true_cur = x_in.grad.detach().reshape(-1).clone()
- 
-            if x_in.grad is not None:
-                x_in.grad.zero_()
-            lg_in[target_idx].backward()
-            g_tgt_cur = x_in.grad.detach().reshape(-1).clone()
- 
-            g_cur = g_true_cur - g_tgt_cur
- 
-            with torch.no_grad():
-                cur_gap = (
-                    lg_in[true_idx] - lg_in.topk(2).values[1]
-                ).item()
- 
+            if len(selected) - last_refresh_count >= REFRESH_INTERVAL:
+                x_in = current_adv.detach().requires_grad_(True)
+                lg_in = logits_for_images(
+                    self.model, x_in.unsqueeze(0)
+                ).squeeze(0)
+    
+                if x_in.grad is not None:
+                    x_in.grad.zero_()
+                lg_in[true_idx].backward(retain_graph=True)
+                g_true_cur = x_in.grad.detach().reshape(-1).clone()
+    
+                if x_in.grad is not None:
+                    x_in.grad.zero_()
+                lg_in[target_idx].backward()
+                g_tgt_cur = x_in.grad.detach().reshape(-1).clone()
+    
+                g_cur = g_true_cur - g_tgt_cur
+    
+                with torch.no_grad():
+                    cur_gap = (
+                        lg_in[true_idx] - lg_in.topk(2).values[1]
+                    ).item()
+                last_refresh_count = len(selected)
             # Scores for this step
             flat_cur = current_adv.reshape(-1)
             sc = (g_cur * flat_cur).abs()
@@ -597,15 +792,31 @@ class PerturbMiner:
                         "selected": selected.copy(),
                         "pred":     pred_now,
                     }
+                    _, flip_q = _quality_on_png(
+                        self.model, clean, snapped, true_idx, true_idx
+                    )
+                    flip_score = _estimate_validator_score(
+                        flip_q,
+                        true_idx,
+                        challenge_epsilon,
+                        (time.perf_counter() - attack_t0) * 1000.0,
+                        timeout_seconds,
+                    )
+                    log_attack(
+                        f"[FLIP] k={len(selected)} margin={margin:.3f}",
+                        prediction=pred_now,
+                        rmse=flip_q.rmse,
+                        norm=flip_q.norm,
+                        estimated_score=flip_score,
+                    )
                 if margin < -1.0:   # deep enough — stop early
                     break
- 
         if best_result is None:
             logger.warning(
                 f"[ATTACK] No flip found after {len(selected)} pixels"
             )
+            log_attack(f"[ATTACK] No flip found after {len(selected)} pixels")
             return None
- 
         # ── Phase 4: backward elimination ─────────────────────────────────
         elim_budget = min(1.2, deadline - time.perf_counter() - 0.3)
         elim_deadline = time.perf_counter() + elim_budget
@@ -660,12 +871,28 @@ class PerturbMiner:
  
         k_final = len(sel)
         rmse    = ((k_final / N) ** 0.5) / 255.0
- 
+
+        _, final_q = _quality_on_png(self.model, clean, curr, true_idx, true_idx)
+        final_score = _estimate_validator_score(
+            final_q,
+            true_idx,
+            challenge_epsilon,
+            (time.perf_counter() - attack_t0) * 1000.0,
+            timeout_seconds,
+        )
+
         logger.info(
             f"[FINAL] k={k_final} rmse={rmse:.2e} "
-            f"norm={eps:.4f} margin={best_result['margin']:.3f}"
+            f"norm={eps:.4f} margin={best_result['margin']:.3f} "
+            f"est_score={final_score:.4f}"
         )
- 
+        log_attack(
+            f"[FINAL] k={k_final} margin={best_result['margin']:.3f}",
+            prediction=best_result["pred"],
+            rmse=final_q.rmse,
+            norm=final_q.norm,
+            estimated_score=final_score,
+        )
         return {
             "image":  curr,
             "k":      k_final,
@@ -682,79 +909,124 @@ class PerturbMiner:
             norm_type=getattr(synapse, "norm_type", "unknown"),
             epsilon=getattr(synapse, "epsilon", "unknown"),
         )
-        if synapse.norm_type != "Linf":
-            logger.info(f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unsupported norm_type={synapse.norm_type}")
-            synapse.perturbed_image_b64 = synapse.clean_image_b64
-            return synapse
 
         task_id = getattr(synapse, "task_id", "unknown")
-        clean = decode_image_b64(synapse.clean_image_b64).to(self.device)
-        true_idx = resolve_target_index(synapse.true_label)
-        if true_idx is None:
-            logger.warning(
-                f"Skipping task={task_id}: unresolved true_label={getattr(synapse, 'true_label', None)}"
-            )
-            synapse.perturbed_image_b64 = synapse.clean_image_b64
-            return synapse
+        model_name = getattr(synapse, "model_name", "")
+        prompt = getattr(synapse, "prompt", "")
+        true_label = getattr(synapse, "true_label", "")
+        synapse_epsilon = float(getattr(synapse, "epsilon", 0.0))
+        norm_type = getattr(synapse, "norm_type", "")
+        min_delta = float(getattr(synapse, "min_delta", 1.0 / 255.0))
 
-        epsilon = 1.0/255.0
-        min_delta = float(getattr(synapse, "min_delta", 1.0/255.0))
-        budget = 13.0
-        t0 = time.perf_counter()
-        deadline = t0 + budget
-        c, h, w = clean.shape
-        logger.info(
-            f"[FORWARD] task_eps={epsilon:.4f} res={c}x{h}x{w} "
-            f"val_linf=[{_VAL_MIN_LINF:.4f},{min(epsilon, _VAL_MAX_LINF):.4f}]"
+        resolution = "unknown"
+        attack_log = _AttackExcelRecorder(
+            self._attack_excel_path,
+            task_id=task_id,
+            model_name=model_name,
+            prompt=prompt,
+            true_label=true_label,
+            epsilon=synapse_epsilon,
+            norm_type=norm_type,
+            min_delta=min_delta,
+            resolution=resolution,
         )
+
+        def log_attack(
+            progress: str,
+            prediction: typing.Optional[int] = None,
+            rmse: typing.Optional[float] = None,
+            norm: typing.Optional[float] = None,
+            estimated_score: typing.Optional[float] = None,
+        ) -> None:
+            attack_log.log(
+                progress,
+                prediction=prediction,
+                rmse=rmse,
+                norm=norm,
+                estimated_score=estimated_score,
+            )
+
         try:
-            result = self._attack(
-                clean, true_idx, epsilon, min_delta, deadline
+            if synapse.norm_type != "Linf":
+                logger.info(f"Skipping task={task_id}: unsupported norm_type={synapse.norm_type}")
+                log_attack(f"[SKIP] unsupported norm_type={synapse.norm_type}")
+                synapse.perturbed_image_b64 = synapse.clean_image_b64
+                return synapse
+
+            clean = decode_image_b64(synapse.clean_image_b64).to(self.device)
+            true_idx = resolve_target_index(synapse.true_label)
+            c, h, w = clean.shape
+            resolution = f"{c}x{h}x{w}"
+            attack_log.set_resolution(resolution)
+            log_attack("[START] attack forward")
+
+            if true_idx is None:
+                logger.warning(
+                    f"Skipping task={task_id}: unresolved true_label={getattr(synapse, 'true_label', None)}"
+                )
+                log_attack(f"[SKIP] unresolved true_label={true_label}")
+                synapse.perturbed_image_b64 = synapse.clean_image_b64
+                return synapse
+
+            epsilon = 1.0/255.0
+            budget = 13.0
+            t0 = time.perf_counter()
+            deadline = t0 + budget
+            timeout_seconds = float(getattr(synapse, "timeout_seconds", C.TIMEOUT_SECONDS))
+            logger.info(
+                f"[FORWARD] task_eps={epsilon:.4f} res={c}x{h}x{w} "
+                f"val_linf=[{_VAL_MIN_LINF:.4f},{min(epsilon, _VAL_MAX_LINF):.4f}]"
             )
-        except Exception as e:
-            logger.warning(f"Attack failed with exception: {e}")
-            result = None
-        if result is None:
-            logger.warning("No flip found — returning clean image")
-            synapse.perturbed_image_b64 = synapse.clean_image_b64
+            try:
+                result = self._attack(
+                    clean,
+                    true_idx,
+                    epsilon,
+                    min_delta,
+                    deadline,
+                    log_attack,
+                    challenge_epsilon=synapse_epsilon,
+                    timeout_seconds=timeout_seconds,
+                    attack_t0=t0,
+                )
+            except Exception as e:
+                logger.warning(f"Attack failed with exception: {e}")
+                log_attack(f"[ERROR] attack exception: {e}")
+                result = None
+            if result is None:
+                logger.warning("No flip found — returning clean image")
+                log_attack("[DONE] no flip — returning clean image", estimated_score=0.0)
+                synapse.perturbed_image_b64 = synapse.clean_image_b64
+                return synapse
+
+            synapse.perturbed_image_b64 = encode_image_b64(result["image"])
+            _, submit_q = _quality_on_png(
+                self.model, clean, result["image"], true_idx, true_idx
+            )
+            submit_score = _estimate_validator_score(
+                submit_q,
+                true_idx,
+                synapse_epsilon,
+                (time.perf_counter() - t0) * 1000.0,
+                timeout_seconds,
+            )
+            logger.info(
+                f"Finished task={task_id} "
+                f"true={true_idx} pred={result['pred']} "
+                f"k={result['k']} rmse={submit_q.rmse:.2e} "
+                f"norm={submit_q.norm:.4f} margin={result['margin']:.3f} "
+                f"est_score={submit_score:.4f}"
+            )
+            log_attack(
+                f"[DONE] submitted k={result['k']} margin={result['margin']:.3f}",
+                prediction=result["pred"],
+                rmse=submit_q.rmse,
+                norm=submit_q.norm,
+                estimated_score=submit_score,
+            )
             return synapse
-        loop = asyncio.get_event_loop()
-        adv = clean
-        (
-            decoded_adv,
-            quality,
-            preflight_ok,
-            preflight_reason,
-            pred_final,
-        ) = await loop.run_in_executor(
-            None,
-            lambda: _finalize_perturbed_image(
-                model=self.model,
-                clean=clean,
-                adv=result["image"],
-                true_label=true_idx,
-                epsilon=epsilon,
-            ),
-        )
-        t_enc0 = time.perf_counter()
-        synapse.perturbed_image_b64 = encode_image_b64(decoded_adv)
-        encode_ms = (time.perf_counter() - t_enc0) * 1000.0
-        logger.info(
-            f"Finished task={task_id} "
-            f"true={true_idx} pred={quality.pred} "
-            f"flip={quality.flipped} l_inf={quality.norm:.5f} rmse={quality.rmse:.2e} "
-            f"ssim={quality.ssim:.4f} psnr={quality.psnr_db:.2f} "
-            f"preflight={preflight_ok} reason={preflight_reason} "
-            f"final_pred={pred_final} "
-            f"encode_ms={encode_ms:.1f} "
-            f"total_ms={(time.perf_counter() - t0) * 1000:.1f}"
-        )
-
-        del adv, clean, decoded_adv
-        if os.getenv("MINER_CUDA_EMPTY_CACHE", "0").strip() == "1":
-            torch.cuda.empty_cache()
-
-        return synapse
+        finally:
+            attack_log.flush()
 
     async def blacklist(self, synapse: AttackChallenge) -> typing.Tuple[bool, str]:
         self._log_step_start(
