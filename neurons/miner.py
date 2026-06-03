@@ -397,7 +397,8 @@ class PerturbMiner:
         epsilon = 1.0/255.0
         min_delta = float(getattr(synapse, "min_delta", 1.0/255.0))
         budget = 13.0
-        deadline = time.perf_counter() + budget
+        t0 = time.perf_counter()
+        deadline = t0 + budget
         c, h, w = clean.shape
         logger.info(
             f"[FORWARD] task_eps={epsilon:.4f} res={c}x{h}x{w} "
