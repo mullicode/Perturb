@@ -644,10 +644,9 @@ class PerturbMiner:
             return None
  
         targets.sort(key=lambda c: c["estimated_rmse"])
-        logger.info(f"[TARGETS] targets={targets}")
         best_target = targets[0]
         target_idx = best_target["target"]
-        k_est = best_target["k_estimated"]
+        k_est = max(int(best_target["k_estimated"] * 2.0), 500)
         logger.info(
             f"[TARGET] best={target_idx} "
             f"est_rmse={best_target['estimated_rmse']:.2e} "
@@ -693,30 +692,64 @@ class PerturbMiner:
                 margin = (lg_s[true_idx] - lg_s.topk(2).values[1]).item()
             return pred != true_idx, margin, snapped
  
-        def get_batch(k_cur, cur_gap):
-            """Adaptive batch size from progress and current confidence."""
-            progress = k_cur / max(k_est, 1)
-            gap_ratio = cur_gap / max(gap_initial, 1e-8)
-            logger.info(f"[GET_BATCH] progress={progress} gap_ratio={gap_ratio}")
-            if progress < 0.03:          # first 3%: exact, batch=1
-                return 20
-            if progress > 0.80:          # last 20%: near boundary, tiny batch
-                return max(1, min(5, int(gap_ratio * 10)))
-            base = (200 if gap_ratio > 0.7 else
-                    100 if gap_ratio > 0.4 else
-                     30 if gap_ratio > 0.2 else 10)
-            return max(5, int(base * (1.0 - progress)))
+        def get_batch(k_cur, cur_gap, refresh_interval_seconds):
+            progress  = k_cur / max(k_est, 1)
+            gap_ratio = max(cur_gap, 0.0) / max(gap_initial, 1e-8)
+
+            time_remaining   = deadline - 1.5 - time.perf_counter()
+            pixels_remaining = max(k_est - k_cur, 1)
+
+            # Correct iters_remaining: how many gradient refreshes left
+            refreshes_left = time_remaining / max(refresh_interval_seconds, 0.05)
+            min_batch = int(pixels_remaining / max(refreshes_left, 1))
+
+            # Near-boundary precision cap
+            # When gap_ratio < 0.15, model is close to flipping — be precise
+            if gap_ratio < 0.05:
+                precision_cap = 2
+            elif gap_ratio < 0.15:
+                precision_cap = 5
+            elif gap_ratio < 0.3:
+                precision_cap = 15
+            else:
+                precision_cap = 9999  # no cap
+
+            # Near-completion precision cap
+            # When progress > 0.95, slow down
+            if progress > 0.95:
+                progress_cap = 3
+            elif progress > 0.85:
+                progress_cap = 10
+            else:
+                progress_cap = 9999
+
+            effective_cap = min(precision_cap, progress_cap)
+            result = max(min_batch, 5)           # floor: always at least 5
+            result = min(result, effective_cap)  # ceiling from precision
+            result = max(result, min_batch)      # but never starve time budget
+            logger.info(f"[GET_BATCH] batch_count={result} min_batch={min_batch} refresh_interval_seconds={refresh_interval_seconds} refreshes_left={refreshes_left} progress_cap={progress_cap}")
+            return result
+
  
         REFRESH_INTERVAL = 50
+        refresh_interval_seconds = 0.2  # initial guess
+        last_refresh_wall = time.perf_counter()
         g_cur = None
         cur_gap = gap
         last_refresh_count = -REFRESH_INTERVAL
-        while len(selected) < int(k_est * 1.5):
+        while len(selected) < int(k_est * 3):
             if time.perf_counter() > deadline - 1.5:
                 break
  
             # Gradient refresh at current adversarial state
             if len(selected) - last_refresh_count >= REFRESH_INTERVAL:
+                now = time.perf_counter()
+                measured = now - last_refresh_wall
+                if measured < 5.0 and last_refresh_count >= 0:
+                    refresh_interval_seconds = 0.7 * refresh_interval_seconds + 0.3 * measured
+                last_refresh_wall = now
+                last_refresh_count = len(selected)
+                # do gradient refresh ...
                 x_in = current_adv.detach().requires_grad_(True)
                 lg_in = logits_for_images(
                     self.model, x_in.unsqueeze(0)
@@ -739,6 +772,25 @@ class PerturbMiner:
                         lg_in[true_idx] - lg_in.topk(2).values[1]
                     ).item()
                 last_refresh_count = len(selected)
+                if cur_gap <= 0:
+                    flipped, margin, snapped = check_flip(current_adv)
+                    if flipped:
+                        if best_result is None or len(selected) < best_result["k"]:
+                            with torch.no_grad():
+                                pred_now = int(
+                                    logits_for_images(
+                                        self.model, snapped.unsqueeze(0)
+                                    ).argmax().item()
+                                )
+                            best_result = {
+                                "image":    snapped.clone(),
+                                "k":        len(selected),
+                                "margin":   margin,
+                                "selected": selected.copy(),
+                                "pred":     pred_now,
+                            }
+                        break
+
             # Scores for this step
             flat_cur = current_adv.reshape(-1)
             sc = (g_cur * flat_cur).abs()
@@ -756,8 +808,7 @@ class PerturbMiner:
  
             if sc.max() <= 0:
                 break
- 
-            batch_size = get_batch(len(selected), cur_gap)
+            batch_size = get_batch(len(selected), cur_gap, refresh_interval_seconds)
             n_pick = min(batch_size, int(valid_cur.sum().item()))
             if n_pick == 0:
                 break
@@ -843,6 +894,7 @@ class PerturbMiner:
             return flat_b.reshape(C, H, W) / 255.0
  
         improved = True
+        logger.info(f"[ELIM] k_initial={len(sel)} elim_deadline={elim_deadline}")
         while improved and time.perf_counter() < elim_deadline:
             improved = False
  
@@ -870,6 +922,7 @@ class PerturbMiner:
                     break   # restart with updated gradient
  
         k_final = len(sel)
+        logger.info(f"[ELIM] k_final={k_final}")
         rmse    = ((k_final / N) ** 0.5) / 255.0
 
         _, final_q = _quality_on_png(self.model, clean, curr, true_idx, true_idx)
