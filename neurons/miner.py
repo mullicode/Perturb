@@ -453,35 +453,6 @@ def _estimate_validator_score(
     speed_score = 1.0 - min(time_ratio, 1.0)
     return float(C.PERTURBATION_WEIGHT * perturbation_score + C.SPEED_WEIGHT * speed_score)
 
-
-def _finalize_perturbed_image(
-    model: torch.nn.Module,
-    clean: torch.Tensor,
-    adv: torch.Tensor,
-    true_label: int,
-    epsilon: float,
-) -> typing.Tuple[torch.Tensor, _AdvQuality, bool, str, int]:
-    """Run preflight checks and final encode/decode verification on a candidate image."""
-    decoded_adv, quality = _quality_on_png(model, clean, adv, true_label, true_label)
-    preflight = _preflight_flip_only(quality, true_label, epsilon)
-
-    encoded_b64 = encode_image_b64(decoded_adv)
-    decoded_final = decode_image_b64(encoded_b64).to(clean.device)
-    pred_final = _pred_index(model, decoded_final)
-
-    if pred_final == true_label:
-        logger.warning(
-            f"[SUBMIT] FLIP LOST after final encode/decode! "
-            f"pred={pred_final} true={true_label} — submitting anyway"
-        )
-    else:
-        logger.info(
-            f"[SUBMIT] encode/decode flip confirmed pred={pred_final} true={true_label}"
-        )
-
-    return decoded_adv, quality, preflight.ok, preflight.reason, pred_final
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  Miner
 # ═══════════════════════════════════════════════════════════════════════════
@@ -727,7 +698,7 @@ class PerturbMiner:
             result = max(min_batch, 5)           # floor: always at least 5
             result = min(result, effective_cap)  # ceiling from precision
             result = max(result, min_batch)      # but never starve time budget
-            logger.info(f"[GET_BATCH] batch_count={result} min_batch={min_batch} refresh_interval_seconds={refresh_interval_seconds} refreshes_left={refreshes_left} progress_cap={progress_cap}")
+            logger.info(f"[GET_BATCH] batch_count={result} current_gap={cur_gap} progress={progress} gap_ratio={gap_ratio}")
             return result
 
  
