@@ -742,7 +742,6 @@ class PerturbMiner:
                     cur_gap = (
                         lg_in[true_idx] - lg_in.topk(2).values[1]
                     ).item()
-                last_refresh_count = len(selected)
                 if cur_gap <= 0:
                     flipped, margin, snapped = check_flip(current_adv)
                     if flipped:
@@ -783,19 +782,19 @@ class PerturbMiner:
             n_pick = min(batch_size, int(valid_cur.sum().item()))
             if n_pick == 0:
                 break
- 
+
             top_idx = torch.topk(sc, n_pick).indices
- 
-            # Apply perturbation in uint8 integer space
-            # Avoids floating point drift that causes roundtrip failures
-            adv_u8 = (current_adv * 255.0).round().clamp(0, 255)
+
+            # Vectorized — replaces entire for loop
+            s_vec = signs_cur[top_idx].long()          # signs for selected pixels
+            adv_u8 = (current_adv * 255.0).round().clamp(0, 255).long()
             flat_u8 = adv_u8.reshape(-1)
-            for idx in top_idx.tolist():
-                s = int(signs_cur[idx].item())
-                flat_u8[idx] = (flat_u8[idx] + s).clamp(0, 255)
-                selected.append(idx)
-                selected_mask[idx] = True
-            current_adv = flat_u8.reshape(C, H, W) / 255.0
+            flat_u8[top_idx] = (flat_u8[top_idx] + s_vec).clamp(0, 255)
+            current_adv = flat_u8.reshape(C, H, W).float() / 255.0
+
+            # Update selected list and mask
+            selected.extend(top_idx.tolist())          # one .tolist() call not N
+            selected_mask[top_idx] = True              # vectorized mask update
  
             # Flip check on uint8 roundtrip
             flipped, margin, snapped = check_flip(current_adv)
