@@ -183,7 +183,7 @@ _VAL_MIN_PSNR_DB   = float(os.getenv("MINER_VAL_MIN_PSNR_DB", "38.0"))
 # inference path and the validator's (TF32 conv, cuDNN algo choice, device,
 # bicubic-resize numerics) — the validator then re-classifies it as the
 # original label (reason=label_match_with_original, score=0).
-_FLIP_MARGIN_EPS   = float(os.getenv("MINER_FLIP_MARGIN_EPS", "0.4"))
+_FLIP_MARGIN_EPS   = float(os.getenv("MINER_FLIP_MARGIN_EPS", "-0.0015"))
 # Match the validator's numerics by disabling TF32 reductions on the miner so
 # a locally-confirmed flip reflects what the validator will actually compute.
 _DISABLE_TF32      = os.getenv("MINER_DISABLE_TF32", "1").strip() not in ("0", "false", "no")
@@ -413,6 +413,10 @@ def _preflight_flip_only(
     eff_max = min(float(epsilon), _VAL_MAX_LINF)
     if quality.pred == tl:
         return _PreflightResult(False, "label_match_with_original", quality)
+    # Critical: avoid boundary-only flips that validator may classify as original.
+    # Keep this tiny for minimum RMSE. Do NOT use 0.4 unless you accept much higher RMSE.
+    if quality.margin > -_FLIP_MARGIN_EPS:
+        return _PreflightResult(False, "weak_flip_margin", quality)
     if quality.norm < _VAL_MIN_LINF:
         return _PreflightResult(False, "below_min_delta", quality)
     if quality.norm > eff_max:
@@ -594,21 +598,25 @@ class PerturbMiner:
             if (eps * g_norm1) < margin_t * 0.1:
                 continue
  
-            estimated_rmse = margin_t / (g_norm2 * (N ** 0.5))
- 
-            # Estimated pixel count using top-1% gradient mean
-            n_top = max(100, int(N * 0.01))
-            top_mean = g_t.abs().topk(n_top).values.mean().item()
+            # Sparse target estimate: more relevant for minimum changed-pixel count.
+            abs_g = g_t.abs()
+            n_top = max(100, int(N * 0.005))  # top 0.5%, not 1%; better sparse estimate
+            top_vals = abs_g.topk(min(n_top, abs_g.numel())).values
+            top_mean = float(top_vals.mean().item())
+            top_sum = float(top_vals.sum().item())
+
             k_est = int(margin_t / max(eps * top_mean, 1e-10))
- 
+
+            # Lower is better. This favors classes where a few pixels have strong effect.
+            sparse_score = margin_t / max(eps * top_sum, 1e-10)
+
             targets.append({
                 "target":         t,
                 "margin":         margin_t,
-                "estimated_rmse": estimated_rmse,
+                "estimated_rmse": sparse_score,
                 "k_estimated":    k_est,
                 "gradient":       g_t,
-            })
- 
+            }) 
         if not targets:
             logger.warning("[ATTACK] No feasible targets found")
             log_attack("[ATTACK] No feasible targets found")
@@ -617,7 +625,9 @@ class PerturbMiner:
         targets.sort(key=lambda c: c["estimated_rmse"])
         best_target = targets[0]
         target_idx = best_target["target"]
-        k_est = max(int(best_target["k_estimated"] * 2.0), 500)
+        # Keep k_est closer to sparse estimate.
+        # Over-inflating k_est makes get_batch more aggressive.
+        k_est = max(int(best_target["k_estimated"] * 1.15), 300)
         logger.info(
             f"[TARGET] best={target_idx} "
             f"est_rmse={best_target['estimated_rmse']:.2e} "
@@ -730,32 +740,53 @@ class PerturbMiner:
             return max(delta, 1.0)
         
         def get_batch(k_cur, cur_gap, last_batch_time):
-            nonlocal is_first_cycle
+            """
+            Smooth dynamic batch controller.
+
+            Uses:
+            - cur_gap: how far from boundary now
+            - gap_fraction: relative progress from initial gap
+            - k_est_remaining: estimated remaining pixels
+            - raw_pace: pixels needed per remaining cycle
+            - prev_batch_size: smooth growth control
+
+            Goal:
+            - no 5k/10k irreversible jumps
+            - still move fast on hard/high-gap images
+            - shrink batch aggressively near boundary
+            - preserve time for elimination
+            """
+            nonlocal is_first_cycle, prev_batch_size
+
             if is_first_cycle:
                 is_first_cycle = False
+                prev_batch_size = CALIBRATION_BATCH
                 return CALIBRATION_BATCH
 
-            time_remaining = deadline - 0.5 - time.perf_counter()
+            now = time.perf_counter()
+            time_remaining = grow_deadline - now
             if time_remaining <= 0:
                 return 1
 
-            gap_fraction = cur_gap / max(gap_initial, 1e-8)
+            gap_initial_safe = max(gap_initial, 1e-8)
+            gap_fraction = cur_gap / gap_initial_safe
 
-            # ── Model fitting ─────────────────────────────────────────
+            # ─────────────────────────────────────────────
+            # 1. Estimate pixels still needed
+            # ─────────────────────────────────────────────
             fit_result = fit_decay_model(gap_history)
-            # fit_decay_model now returns 4 values
             if fit_result[0] is not None:
                 lam, gap_at_k_min, exp_residual, k_min_fit = fit_result
             else:
-                lam, gap_at_k_min, exp_residual, k_min_fit = None, None, float('inf'), 0
+                lam, gap_at_k_min, exp_residual, k_min_fit = None, None, float("inf"), 0
 
             linear_rate = fit_linear_model(gap_history)
 
             use_exponential = (
-                lam is not None and
-                lam > 1e-8 and
-                exp_residual < 0.15 and
-                len(gap_history) >= 3
+                lam is not None
+                and lam > 1e-8
+                and exp_residual < 0.12
+                and len(gap_history) >= 4
             )
 
             if use_exponential:
@@ -763,76 +794,136 @@ class PerturbMiner:
                     cur_gap, lam, gap_at_k_min, k_min_fit, k_cur
                 )
                 model_name = "exp"
-                natural_batch = max(1, int(0.0513 / lam))
             elif linear_rate is not None and linear_rate > 1e-9:
                 pixels_needed = cur_gap / linear_rate
                 model_name = "linear"
-                natural_batch = None
             else:
                 pixels_needed = max(k_est - k_cur, 1.0)
                 model_name = "fallback"
-                natural_batch = None
 
-            # ── Time budget ───────────────────────────────────────────
-            # last_batch_time = cost of one full cycle (gradient + selection)
-            # This is the direct measurement, not an estimate
-            cost_per_cycle = max(last_batch_time, 0.02)
-            cycles_remaining = time_remaining / cost_per_cycle
+            if not math.isfinite(pixels_needed) or pixels_needed <= 0:
+                pixels_needed = max(k_est - k_cur, 1.0)
+                model_name = "fallback_bad_model"
 
-            # NEW
-            # pace_batch = pixels this cycle must deliver to finish on time
-            # = pixels_needed spread evenly across remaining cycles
-            pace_batch = max(1, int(math.ceil(pixels_needed / max(cycles_remaining, 1.0))))
+            # ─────────────────────────────────────────────
+            # 2. Remaining-time dynamic pace
+            # ─────────────────────────────────────────────
+            cost_per_cycle = max(last_batch_time, 0.12)
+            cycles_remaining = max(1.0, time_remaining / cost_per_cycle)
 
-            # time_ratio = pace_batch / natural_batch
-            # > 1: behind pace (need bigger batches than natural)
-            # < 1: ahead of pace (natural batch is fine)
-            if natural_batch is not None:
-                time_ratio = pace_batch / max(natural_batch, 1)
+            raw_pace = int(math.ceil(pixels_needed / cycles_remaining))
+            raw_pace = max(1, raw_pace)
+
+            # ─────────────────────────────────────────────
+            # 3. k_est + gap-aware cap
+            # This is the main fix.
+            # ─────────────────────────────────────────────
+            k_est_remaining = max(k_est - k_cur, 1)
+
+            if cur_gap > 3.0:
+                gap_cap = 768; k_cap = int(0.080 * k_est_remaining); phase_floor = 48
+            elif cur_gap > 2.0:
+                gap_cap = 640; k_cap = int(0.070 * k_est_remaining); phase_floor = 40
+            elif cur_gap > 1.0:
+                gap_cap = 512; k_cap = int(0.060 * k_est_remaining); phase_floor = 32
+            elif cur_gap > 0.50:
+                gap_cap = 384; k_cap = int(0.045 * k_est_remaining); phase_floor = 24
+            elif cur_gap > 0.20:
+                gap_cap = 192; k_cap = int(0.030 * k_est_remaining); phase_floor = 12
+            elif cur_gap > 0.10:
+                gap_cap = 96; k_cap = int(0.020 * k_est_remaining); phase_floor = 6
+            elif cur_gap > 0.05:
+                gap_cap = 48; k_cap = int(0.012 * k_est_remaining); phase_floor = 2
+            elif cur_gap > 0.02:
+                gap_cap = 16; k_cap = int(0.006 * k_est_remaining); phase_floor = 1
+            elif cur_gap > 0.01:
+                gap_cap = 4; k_cap = 4; phase_floor = 1
+            elif cur_gap > 0.003:
+                gap_cap = 2; k_cap = 2; phase_floor = 1
             else:
-                time_ratio = 1.0
+                gap_cap = 1; k_cap = 1; phase_floor = 1
 
-            if use_exponential and lam > 1e-10:
-                natural_batch = max(1, int(0.0513 / lam))
-                if time_ratio <= 1.0:
-                    batch = natural_batch
-                else:
-                    # Scale up proportionally to how far behind we are
-                    batch = max(natural_batch, int(math.ceil(natural_batch * time_ratio)))
-            else:
-                # Linear or fallback: just use pace directly
-                batch = pace_batch
+            # Scale phase_floor down for small images to prevent overshooting
+            # the flip boundary in early cycles.
+            # For k_est < 500, a floor of 32 means 6%+ of budget per cycle.
+            if k_est < 500:
+                phase_floor = min(phase_floor, max(1, k_est // 20))
+            elif k_est < 1500:
+                phase_floor = min(phase_floor, max(1, k_est // 40))
 
-            # Hard floor: pace_batch is the minimum required to finish in time.
-            # natural_batch or time_ratio logic may produce a smaller value when
-            # last_batch_time was stale or lam is small — this guarantees we
-            # never fall below the pace required to reach the flip before deadline.
-            batch = max(batch, pace_batch)
+            # gap_fraction caps: prevent large batches when RELATIVELY near boundary.
+            # But only tighten when cur_gap is ALSO absolutely small — otherwise
+            # a large initial gap causes premature tightening at non-critical points.
+            if gap_fraction < 0.05 and cur_gap < 0.30:
+                gap_cap = min(gap_cap, 32)
 
-            # ── Near-boundary precision: rate-derived, never arbitrary ─
-            # When gap is small, compute maximum batch such that
-            # the expected gap after this batch stays > 0 with margin.
-            # If batch is too large, we skip over the boundary without detecting flip.
-            if gap_fraction < 0.05 and use_exponential and lam > 1e-10:
-                # Only cap when truly near boundary (gap < 5% of initial)
-                # Allow up to 80% gap reduction per batch
-                max_overshoot_batch = max(1, int(1.609 / lam))
-                batch = min(batch, max_overshoot_batch)
-            elif gap_fraction < 0.05 and linear_rate is not None and linear_rate > 1e-9:
-                max_drop_batch = max(1, int(cur_gap * 0.80 / linear_rate))
-                batch = min(batch, max_drop_batch)
+            if gap_fraction < 0.03 and cur_gap < 0.15:
+                gap_cap = min(gap_cap, 16)
 
+            if gap_fraction < 0.015 and cur_gap < 0.08:
+                gap_cap = min(gap_cap, 8)
+
+            if gap_fraction < 0.008 and cur_gap < 0.04:
+                gap_cap = min(gap_cap, 2)
+
+            phase_cap = max(1, min(gap_cap, max(1, k_cap)))
+
+            # ─────────────────────────────────────────────
+            # 4. Smooth growth cap
+            # Prevents sudden 5859 -> 11349 style jumps.
+            # ─────────────────────────────────────────────
+            growth_factor = 1.40
+
+            # If very far from boundary and raw_pace is high, allow slightly faster growth.
+            if cur_gap > 2.0 and gap_fraction > 0.50:
+                growth_factor = 1.65
+
+            # Near boundary, slow growth strongly.
+            if cur_gap < 0.10 or gap_fraction < 0.05:
+                growth_factor = 1.15
+
+            growth_cap = max(phase_floor, int(prev_batch_size * growth_factor) + 1)
+
+            # Allow faster ramp-up when far from boundary and pace greatly exceeds
+            # growth cap. Avoids 4-8 cycles of under-utilization on hard images.
+            if cur_gap > 1.5 and raw_pace > growth_cap * 1.5:
+                growth_cap = min(raw_pace, phase_cap)
+
+            # Final batch is dynamic, but bounded.
+            batch = min(raw_pace, phase_cap, growth_cap)
+            batch = max(phase_floor, batch)
+
+            # ─────────────────────────────────────────────
+            # 5. Near-boundary safety clamp
+            # This prevents overshooting into weak margin / unstable flip.
+            # ─────────────────────────────────────────────
+            if cur_gap < 0.05:
+                if linear_rate is not None and linear_rate > 1e-9:
+                    max_safe = max(1, int(cur_gap * 0.50 / linear_rate))
+                    batch = min(batch, max_safe)
+                batch = min(batch, 8)
+
+            if cur_gap < 0.015:
+                batch = min(batch, 2)
+
+            if cur_gap < 0.005:
+                batch = 1
+
+            # ─────────────────────────────────────────────
+            # 6. Non-monotonic progress guard
+            # If gap is not decreasing, halve batch.
+            # ─────────────────────────────────────────────
             if len(gap_history) >= 3:
                 recent = gap_history[-3:]
                 non_mono = sum(
                     1 for i in range(1, len(recent))
-                    if recent[i][1] >= recent[i-1][1]
+                    if recent[i][1] >= recent[i - 1][1]
                 )
                 if non_mono >= 2:
                     batch = max(1, batch // 2)
 
-            batch = max(batch, 1)
-
+            batch = int(max(1, batch))
+            prev_batch_size = batch
 
             lam_str = f"{lam:.2e}" if lam else "None"
             residual_str = (
@@ -840,29 +931,43 @@ class PerturbMiner:
                 if exp_residual != float("inf")
                 else "inf"
             )
-            logger.info(
-                f"[GET_BATCH] batch={batch} gap={cur_gap:.4f} frac={gap_fraction:.3f} "
-                f"model={model_name} lam={lam_str} residual={residual_str} "
-                f"pixels_needed={int(pixels_needed)} pace={pace_batch} "
-                f"natural={natural_batch if natural_batch is not None else 'N/A'} "
-                f"time_ratio={time_ratio:.3f} time_left={time_remaining:.2f}"
-            )
-            return batch
 
+            logger.info(
+                f"[GET_BATCH_SMOOTH] batch={batch} raw_pace={raw_pace} "
+                f"phase_cap={phase_cap} growth_cap={growth_cap} "
+                f"gap={cur_gap:.4f} frac={gap_fraction:.3f} "
+                f"model={model_name} lam={lam_str} residual={residual_str} "
+                f"pixels_needed={int(pixels_needed)} "
+                f"k_cur={k_cur} k_est={k_est} k_rem={k_est_remaining} "
+                f"cycles_left={cycles_remaining:.1f} time_left={time_remaining:.2f}"
+            )
+
+            return batch
+        
         def check_flip(adv_float):
-            """Verify flip on uint8-roundtripped image."""
+            """
+            Verify flip on uint8-snapped image.
+            margin = true_logit - best_non_true_logit.
+            margin < 0 means flipped.
+            margin <= -_FLIP_MARGIN_EPS means safer validator flip.
+            """
             snapped = (adv_float * 255.0).round().clamp(0, 255) / 255.0
             with torch.no_grad():
                 lg_s = logits_for_images(
                     self.model, snapped.unsqueeze(0)
-                ).squeeze(0)
+                ).squeeze(0).float()
+
                 pred = int(lg_s.argmax().item())
-                margin = (lg_s[true_idx] - lg_s[pred]).item()
+                comp = lg_s.clone()
+                comp[true_idx] = float("-inf")
+                best_other = int(comp.argmax().item())
+                margin = float(lg_s[true_idx].item() - lg_s[best_other].item())
+
             return pred != true_idx, margin, snapped
 
         current_adv = clean.clone()
         selected = []                                        # pixel indices
-        selected_mask = torch.zeros(N, dtype=torch.bool, device=self.device)
+        # selected_mask = torch.zeros(N, dtype=torch.bool, device=self.device)
         selected_signs = torch.zeros(N, dtype=torch.long, device=self.device)
         best_result = None
         gap_initial = gap
@@ -876,19 +981,71 @@ class PerturbMiner:
         is_first_cycle = True
 
         gap_history = [(0, gap_initial, time.perf_counter())]
+        ELIM_RESERVE = float(os.getenv("MINER_ELIM_RESERVE", "2.6"))
+        FINAL_BUFFER = 0.25
+        grow_deadline = deadline - ELIM_RESERVE
+        final_deadline = deadline - FINAL_BUFFER
         last_batch_time = 0.20
+        prev_batch_size = CALIBRATION_BATCH
+        flip_seen_once = False
+
         while True:
-            if time.perf_counter() > deadline - 0.5:
+            # Stop growing early. Remaining time is for elimination.
+            if time.perf_counter() > grow_deadline:
                 break
             cycle_start = time.perf_counter()
             x_in = current_adv.detach().requires_grad_(True)
             lg_in = logits_for_images(self.model, x_in.unsqueeze(0)).squeeze(0)
 
-            # Compute gap from the SAME forward pass — no extra forward needed
+            # Compute gaps from the SAME forward pass — no extra forward needed.
             with torch.no_grad():
-                cur_gap = (lg_in[true_idx] - lg_in.topk(2).values[1]).item()
+                comp = lg_in.detach().clone()
+                comp[true_idx] = float("-inf")
+                runner_up_idx = int(comp.argmax().item())
 
-            # Two backward passes sharing the same retained graph
+                # Actual untargeted flip boundary.
+                rank2_gap = float(lg_in[true_idx].item() - lg_in[runner_up_idx].item())
+
+                # Selected target boundary used by the current gradient.
+                target_gap = float(lg_in[true_idx].item() - lg_in[target_idx].item())
+
+            # Dynamic target switch:
+            # If another class is now clearly closer than the selected target,
+            # follow the actual nearest boundary.
+            if runner_up_idx != target_idx and rank2_gap + 0.02 < target_gap:
+                old_target_idx = target_idx
+
+                target_idx = runner_up_idx
+
+                # After switching, recompute target_gap for the new target.
+                target_gap = rank2_gap
+                cur_gap = rank2_gap
+
+                logger.info(
+                    f"[TARGET_SWITCH] old={old_target_idx} new={target_idx} "
+                    f"old_target_gap={float(lg_in[true_idx].item() - lg_in[old_target_idx].item()):.4f} "
+                    f"new_target_gap={target_gap:.4f} rank2_gap={rank2_gap:.4f}"
+                )
+
+                # Reset history because the gap model changed target.
+                gap_history = [(len(selected), max(cur_gap, 1e-6), time.perf_counter())]
+
+                # Reduce batch after target switch to avoid overshoot.
+                prev_batch_size = min(prev_batch_size, 32)
+            else:
+                # Normal case: growth model follows selected target gap.
+                cur_gap = target_gap
+
+            logger.info(
+                f"[ATTACK] target_gap={target_gap:.4f} rank2_gap={rank2_gap:.4f} "
+                f"target_idx={target_idx} runner_up_idx={runner_up_idx} cur_gap={cur_gap:.4f}"
+            )
+
+            # Two backward passes sharing the same retained graph.
+            # IMPORTANT: this now uses the possibly switched target_idx.
+            if x_in.grad is not None:
+                x_in.grad.zero_()
+
             lg_in[true_idx].backward(retain_graph=True)
             g_true_cur = x_in.grad.detach().reshape(-1).clone()
 
@@ -908,13 +1065,22 @@ class PerturbMiner:
             if len(selected) > k_est * 1.5 and best_result is None and cur_gap > 0.05:
                 logger.warning(
                     f"[ATTACK] Exceeded 1.5x k_est={k_est} at k={len(selected)} "
-                    f"gap={cur_gap:.4f} — stopping, greedy exhausted"
+                    f"gap={cur_gap:.4f} — switching to runner-up if possible"
                 )
+
+                # Do not return clean immediately. Switch to the current nearest class.
+                if "runner_up_idx" in locals() and runner_up_idx != target_idx:
+                    target_idx = runner_up_idx
+                    cur_gap = rank2_gap
+                    gap_history = [(len(selected), max(cur_gap, 1e-6), time.perf_counter())]
+                    prev_batch_size = max(1, min(prev_batch_size, 32))
+                    continue
+
                 break
 
             if cur_gap < 2.0:
                 _flipped, _margin, _snapped = check_flip(current_adv)
-                if _flipped:
+                if _flipped and _margin <= -_FLIP_MARGIN_EPS:
                     _, flip_q = _quality_on_png(
                         self.model, clean, _snapped, true_idx, true_idx
                     )
@@ -943,23 +1109,59 @@ class PerturbMiner:
                             norm=flip_q.norm,
                             estimated_score=flip_score,
                         )
-                        if flip_q.rmse < 0.3 * _VAL_MAX_LINF:
-                            break
-
+                        break
+            # If actual untargeted boundary is already close, force direct flip check.
+            # This prevents continuing target-gradient steps while rank2 boundary is unresolved.
+            if rank2_gap < 0.02 or cur_gap < 0.02:
+                _flipped_near, _margin_near, _snapped_near = check_flip(current_adv)
+                if _flipped_near and _margin_near <= -_FLIP_MARGIN_EPS:
+                    _, flip_q_near = _quality_on_png(
+                        self.model, clean, _snapped_near, true_idx, true_idx
+                    )
+                    preflight_near = _preflight_flip_only(
+                        flip_q_near, true_idx, challenge_epsilon
+                    )
+                    if preflight_near.ok:
+                        best_result = {
+                            "image":    _snapped_near.clone(),
+                            "k":        len(selected),
+                            "margin":   _margin_near,
+                            "selected": selected.copy(),
+                            "pred":     int(flip_q_near.pred),
+                            "rmse_val": flip_q_near.rmse,
+                        }
+                        logger.info(
+                            f"[RANK2_SAFE_FLIP] k={len(selected)} "
+                            f"margin={_margin_near:.5f} rmse={flip_q_near.rmse:.2e}"
+                        )
+                        break
             batch_size = get_batch(len(selected), cur_gap, last_batch_time)
             # Scores for this step
             flat_cur = current_adv.reshape(-1)
+            flat_clean = clean.reshape(-1)
             sc = g_cur.abs()
-            sc[selected_mask] = 0.0
- 
-            # Direction validity at current state
-            q_cur = (flat_cur * 255.0).round()
+
+            # Direction from current gradient.
             signs_cur = -g_cur.sign()
             signs_cur[signs_cur == 0] = 1.0
-            valid_cur = (
+
+            # Current uint8 and clean uint8 are the source of truth.
+            q_cur = (flat_cur * 255.0).round().clamp(0, 255)
+            q_clean = (flat_clean * 255.0).round().clamp(0, 255)
+
+            # IMPORTANT:
+            # Only allow pixels still equal to clean.
+            # This prevents +2/255 or -2/255 even if selected_mask is wrong.
+            unchanged_from_clean = (q_cur == q_clean)
+
+            # After applying one step, pixel must remain valid.
+            valid_step = (
                 ((signs_cur > 0) & (q_cur < 255)) |
                 ((signs_cur < 0) & (q_cur > 0))
             )
+
+            valid_cur = unchanged_from_clean & valid_step
+
             sc[~valid_cur] = 0.0
  
             if sc.max() <= 0:
@@ -973,15 +1175,20 @@ class PerturbMiner:
             # misorder the last few pixels. Directly measuring actual gap delta
             # per forward pass finds the minimum-k flip path.
             # Cost: n_measure × 1 forward pass. Only runs when it matters.
-            if cur_gap < 0.05 and n_pick <= 5:
+            if (rank2_gap < 0.05 or runner_up_idx != target_idx) and n_pick <= 5:
                 try:
                     _n_direct = min(n_pick * 6, 30)
                     _direct_cands = torch.topk(sc, min(_n_direct, int((sc > 0).sum().item()))).indices
                     if len(_direct_cands) >= n_pick:
                         _base_u8 = (current_adv * 255.0).round().clamp(0, 255).long()
                         with torch.no_grad():
-                            _lg_base = logits_for_images(self.model, current_adv.unsqueeze(0)).squeeze(0)
-                            _gap_base = (_lg_base[true_idx] - _lg_base[target_idx]).item()
+                            _lg_base = logits_for_images(self.model, current_adv.unsqueeze(0)).squeeze(0).float()
+                            _comp_base = _lg_base.clone()
+                            _comp_base[true_idx] = float("-inf")
+                            _best_base = int(_comp_base.argmax().item())
+
+                            # Near-boundary direct scoring should optimize actual untargeted margin.
+                            _gap_base = float(_lg_base[true_idx].item() - _lg_base[_best_base].item())
                         _delta_gaps = []
                         for _ci in _direct_cands.tolist():
                             _test_u8 = _base_u8.clone()
@@ -994,7 +1201,11 @@ class PerturbMiner:
                             _test_img = _flat_test.reshape(C, H, W).float() / 255.0
                             with torch.no_grad():
                                 _lg_t = logits_for_images(self.model, _test_img.unsqueeze(0)).squeeze(0)
-                                _dgap = (_lg_t[true_idx] - _lg_t[target_idx]).item() - _gap_base
+                                _comp_t = _lg_t.clone()
+                                _comp_t[true_idx] = float("-inf")
+                                _best_t = int(_comp_t.argmax().item())
+                                _gap_t = float(_lg_t[true_idx].item() - _lg_t[_best_t].item())
+                                _dgap = _gap_t - _gap_base
                             _delta_gaps.append((_ci, _dgap))
                         # Most negative Δgap = most gap reduction = best pixel
                         _delta_gaps.sort(key=lambda z: z[1])
@@ -1016,28 +1227,52 @@ class PerturbMiner:
             flat_u8[top_idx] = (flat_u8[top_idx] + s_vec).clamp(0, 255)
             current_adv = flat_u8.reshape(C, H, W).float() / 255.0
 
-            # Update selected list and mask
-            selected.extend(top_idx.tolist())
-            selected_mask[top_idx] = True
+            # Update selected list and signs.
+            # selected_mask removed: unchanged_from_clean already prevents re-selection.
+            new_indices = top_idx.tolist()
+            selected.extend(new_indices)
             selected_signs[top_idx] = s_vec
             last_batch_time = 0.7 * last_batch_time + 0.3 * max(time.perf_counter() - cycle_start, 0.02)
             # Flip check on uint8 roundtrip
-            if best_result is None:
-                _flipped2, _margin2, _snapped2 = check_flip(current_adv)
-                if _flipped2:
-                    _, flip_q2 = _quality_on_png(
-                        self.model, clean, _snapped2, true_idx, true_idx
+            _flipped2, _margin2, _snapped2 = check_flip(current_adv)
+            if _flipped2 and _margin2 <= -0.0015:
+                _, flip_q2 = _quality_on_png(
+                    self.model, clean, _snapped2, true_idx, true_idx
+                )
+                preflight2 = _preflight_flip_only(flip_q2, true_idx, challenge_epsilon)
+
+                if preflight2.ok:
+                    best_result = {
+                        "image":    _snapped2.clone(),
+                        "k":        len(selected),
+                        "margin":   _margin2,
+                        "selected": selected.copy(),
+                        "pred":     int(flip_q2.pred),
+                        "rmse_val": flip_q2.rmse,
+                    }
+
+                    logger.info(
+                        f"[FIRST_FLIP_STOP_GROWTH] k={len(selected)} "
+                        f"margin={_margin2:.5f} rmse={flip_q2.rmse:.2e}"
                     )
-                    preflight2 = _preflight_flip_only(flip_q2, true_idx, challenge_epsilon)
-                    if preflight2.ok:
-                        best_result = {
-                            "image":    _snapped2.clone(),
-                            "k":        len(selected),
-                            "margin":   _margin2,
-                            "selected": selected.copy(),
-                            "pred":     int(flip_q2.pred),
-                            "rmse_val": flip_q2.rmse,
-                        }
+
+                    log_attack(
+                        f"[FIRST_FLIP] k={len(selected)} margin={_margin2:.5f}",
+                        prediction=int(flip_q2.pred),
+                        rmse=flip_q2.rmse,
+                        norm=flip_q2.norm,
+                        estimated_score=_estimate_validator_score(
+                            flip_q2,
+                            true_idx,
+                            challenge_epsilon,
+                            (time.perf_counter() - attack_t0) * 1000.0,
+                            timeout_seconds,
+                        ),
+                    )
+
+                    # Main fix: stop growing immediately.
+                    # Do not continue gradient updates after first accepted flip.
+                    break
 
         if best_result is None:
             logger.warning(
@@ -1046,27 +1281,52 @@ class PerturbMiner:
             log_attack(f"[ATTACK] No flip found after {len(selected)} pixels")
             return None
         # ── Phase 4: backward elimination ─────────────────────────────────
-        elim_budget = min(1.2, deadline - time.perf_counter() - 0.3)
-        elim_deadline = time.perf_counter() + elim_budget
-        # Store actual sign used when pixel was selected
+        # Use all reserved time for elimination.
+        elim_budget = max(0.0, final_deadline - time.perf_counter())
+        elim_deadline = final_deadline
+
+        logger.info(f"[ELIM] k_initial={best_result['k']} elim_budget={elim_budget:.3f}")
         sel = best_result["selected"].copy()
         curr = best_result["image"].clone()
+        def rebuild(sel_list):
+            # Vectorized — identical to apply_sel() but without torch.tensor overhead
+            # for the common case where sel_list is already a list of ints.
+            base = (clean * 255.0).round().clamp(0, 255).long()
+            flat_b = base.reshape(-1)
+            if sel_list:
+                sel_t = torch.tensor(sel_list, dtype=torch.long, device=self.device)
+                s = selected_signs[sel_t]
+                flat_b[sel_t] = (flat_b[sel_t] + s).clamp(0, 255)
+            return flat_b.reshape(C, H, W).float() / 255.0
 
+            return flat.reshape(C, H, W).float() / 255.0
         def still_flips(adv_float):
+            # Fast path: only check norm gate + flip. Skip SSIM/PSNR for probes.
+            # Full preflight only runs on the final accepted result.
             try:
                 decoded = _encode_decode_roundtrip(adv_float)
             except Exception:
                 decoded = (adv_float * 255.0).round().clamp(0, 255) / 255.0
-            with torch.no_grad():
-                lg2 = logits_for_images(
-                    self.model, decoded.unsqueeze(0)
-                ).squeeze(0)
-                pred2 = int(lg2.argmax().item())
-                marg = (lg2[true_idx] - lg2[pred2]).item()
-            if lg2.argmax().item() == true_idx:
+
+            diff = decoded - clean
+            norm = float(diff.abs().max().item())
+            eff_max = min(float(challenge_epsilon), _VAL_MAX_LINF)
+            # Reject immediately if norm gates fail — no model call needed.
+            if norm < _VAL_MIN_LINF or norm > eff_max:
                 return False
-            q = _measure_adv_quality(self.model, clean, decoded, true_idx, true_idx)
-            return _preflight_flip_only(q, true_idx, challenge_epsilon).ok
+
+            with torch.inference_mode():
+                logits = _model_logits_batch(
+                    self.model, decoded.unsqueeze(0).float()
+                ).squeeze(0).float()
+            pred = int(logits.argmax().item())
+            if pred == true_idx:
+                return False
+            # Check margin gate — same threshold as _preflight_flip_only.
+            competitor = logits.clone()
+            competitor[true_idx] = float("-inf")
+            margin = float(logits[true_idx].item() - competitor.max().item())
+            return margin <= -_FLIP_MARGIN_EPS
 
         def apply_sel(sel_list):
             """Rebuild adversarial image from selection list."""
@@ -1076,9 +1336,69 @@ class PerturbMiner:
             s = selected_signs[sel_t]          # actual signs used at selection time
             flat_b[sel_t] = (flat_b[sel_t] + s).clamp(0, 255)
             return flat_b.reshape(C, H, W).float() / 255.0
- 
+
+        # ── Prefix binary shrink first ─────────────────────────────
+        # Finds smallest prefix of selected pixels that still flips.
+        # This is very fast and often removes a lot of late-added pixels.
+        lo, hi = 1, len(sel)
+        best_prefix = sel
+        best_prefix_adv = curr
+
+        while lo <= hi and time.perf_counter() < elim_deadline:
+            mid = (lo + hi) // 2
+            trial_sel = sel[:mid]
+            trial_adv = rebuild(trial_sel)
+
+            if still_flips(trial_adv):
+                best_prefix = trial_sel
+                best_prefix_adv = trial_adv
+                hi = mid - 1
+            else:
+                lo = mid + 1
+
+        if len(best_prefix) < len(sel):
+            logger.info(
+                f"[ELIM_PREFIX] k {len(sel)} -> {len(best_prefix)}"
+            )
+            sel = best_prefix
+            curr = best_prefix_adv
+
+        block = max(1, len(sel) // 4)
+        while block >= 1 and time.perf_counter() < elim_deadline:
+            improved = False
+            # Try removing lower-priority later pixels first.
+            starts = list(range(max(0, len(sel) - block), -1, -block))
+            if 0 not in starts:
+                starts.append(0)
+
+            for start in starts:
+                if time.perf_counter() >= elim_deadline:
+                    break
+
+                end = min(start + block, len(sel))
+                if end <= start:
+                    continue
+
+                trial_sel = sel[:start] + sel[end:]
+                if not trial_sel:
+                    continue
+
+                trial = rebuild(trial_sel)
+
+                if still_flips(trial):
+                    sel = trial_sel
+                    curr = trial
+                    improved = True
+                    logger.info(
+                        f"[ELIM_CHUNK] removed={end-start} k={len(sel)} block={block}"
+                    )
+                    break
+
+            if not improved:
+                block //= 2
         improved = True
         logger.info(f"[ELIM] k_initial={len(sel)} elim_budget={elim_budget}")
+
         while improved and time.perf_counter() < elim_deadline:
             improved = False
  
@@ -1118,10 +1438,35 @@ class PerturbMiner:
             timeout_seconds,
         )
 
+        final_pred = int(final_q.pred)
+        final_margin = float(final_q.margin)
+
+        # Safety: if elimination made the final image invalid, fall back to best_result.
+        final_preflight = _preflight_flip_only(final_q, true_idx, challenge_epsilon)
+        if not final_preflight.ok:
+            logger.warning(
+                f"[FINAL_INVALID_AFTER_ELIM] reason={final_preflight.reason} "
+                f"k_elim={k_final}; falling back to first safe flip k={best_result['k']}"
+            )
+            curr = best_result["image"].clone()
+            k_final = int(best_result["k"])
+            _, final_q = _quality_on_png(self.model, clean, curr, true_idx, true_idx)
+            final_score = _estimate_validator_score(
+                final_q,
+                true_idx,
+                challenge_epsilon,
+                (time.perf_counter() - attack_t0) * 1000.0,
+                timeout_seconds,
+            )
+            final_pred = int(final_q.pred)
+            final_margin = float(final_q.margin)
+
+        rmse = float(final_q.rmse)
+
         logger.info(
             f"[FINAL] k={k_final} rmse={rmse:.2e} "
-            f"norm={eps:.4f} margin={best_result['margin']:.3f} "
-            f"est_score={final_score:.4f}"
+            f"norm={final_q.norm:.4f} margin={final_margin:.5f} "
+            f"pred={final_pred} est_score={final_score:.4f}"
         )
         log_attack(
             f"[FINAL] k={k_final} margin={best_result['margin']:.3f}",
@@ -1133,10 +1478,10 @@ class PerturbMiner:
         return {
             "image":  curr,
             "k":      k_final,
-            "rmse":   rmse,
-            "norm":   eps,
-            "margin": best_result["margin"],
-            "pred":   best_result["pred"],
+            "rmse":   final_q.rmse,
+            "norm":   final_q.norm,
+            "margin": final_margin,
+            "pred":   final_pred,
         }
 
     async def forward(self, synapse: AttackChallenge) -> AttackChallenge:
