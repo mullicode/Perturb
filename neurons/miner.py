@@ -627,31 +627,231 @@ class PerturbMiner:
             f"[TARGET] best={target_idx} "
             f"est_rmse={best_target['estimated_rmse']:.2e} k_est={k_est}"
         )
-        # ── Phase 2: pixel ranking ─────────────────────────────────────────
-        g_tgt = best_target["gradient"]
-        signs = -g_tgt.sign()
-        signs[signs == 0] = 1.0
- 
-        # grad × input: SE-aware pixel importance score
-        scores = (g_tgt * clean.reshape(-1)).abs()
- 
-        # valid_dir: only pixels where the gradient-required direction
-        # is actually achievable after uint8 clipping
-        flat_clean = clean.reshape(-1)
-        q_flat = (flat_clean * 255.0).round()
-        valid_dir = (
-            ((signs > 0) & (q_flat < 255)) |
-            ((signs < 0) & (q_flat > 0))
-        )
-        scores[~valid_dir] = 0.0
- 
-        # ── Phase 3: adaptive greedy ───────────────────────────────────────
-        current_adv = clean.clone()
-        selected = []                                        # pixel indices
-        selected_mask = torch.zeros(N, dtype=torch.bool, device=self.device)
-        best_result = None
-        gap_initial = gap
- 
+        # ── Phase 2: adaptive greedy ───────────────────────────────────────
+        def fit_decay_model(gap_history):
+            if len(gap_history) < 3:
+                return None, None, float('inf'), 0
+
+            points = [(p, g) for p, g, _ in gap_history if g > 1e-6]
+            if len(points) < 3:
+                return None, None, float('inf'), 0
+
+
+            # ── KEY FIX: work in relative coordinates ─────────────────
+            # Instead of fitting gap(k) = gap_0 * exp(-lam * k) in absolute k,
+            # normalize x to [0, 1] range to prevent overflow in math.exp(a).
+            # This makes the intercept a = ln(gap at x=0) which is bounded.
+            k_min = points[0][0]
+            k_max = max(points[-1][0], k_min + 1)
+            k_range = k_max - k_min
+
+            n = len(points)
+            weights = []
+            non_monotone_count = 0
+            for i in range(n):
+                if i == 0:
+                    weights.append(1.0)
+                    continue
+                _, g_prev = points[i-1]
+                _, g_cur  = points[i]
+                if g_cur >= g_prev:
+                    non_monotone_count += 1
+                    weights.append(0.1)
+                else:
+                    recency = 1.0 + 2.0 * (i / max(n - 1, 1))
+                    weights.append(recency)
+
+            # Normalize x to [0,1] — prevents exp overflow entirely
+            xs = [(p[0] - k_min) / k_range for p in points]
+            ys = [math.log(max(p[1], 1e-10)) for p in points]
+            ws = weights[:n]
+
+            sw   = sum(ws)
+            swx  = sum(w * x for w, x in zip(ws, xs))
+            swy  = sum(w * y for w, y in zip(ws, ys))
+            swxx = sum(w * x * x for w, x in zip(ws, xs))
+            swxy = sum(w * x * y for w, x, y in zip(ws, xs, ys))
+
+            denom = sw * swxx - swx * swx
+            if abs(denom) < 1e-12:
+                return None, None, float('inf'), 0
+
+            b = (sw * swxy - swx * swy) / denom   # slope in normalized space
+            a = (swy - b * swx) / sw               # intercept = ln(gap at k_min)
+
+            # lam in normalized space → convert back to per-pixel lam
+            # In normalized space: gap(x) = exp(a) * exp(b*x), x = (k-k_min)/k_range
+            # In pixel space:      gap(k) = exp(a) * exp(b*(k-k_min)/k_range)
+            #                             = exp(a) * exp((b/k_range)*(k-k_min))
+            # So lam_per_pixel = -b / k_range
+            lam = -b / k_range   # always in per-pixel units
+
+            # gap_0 at k=k_min — bounded because a = ln(gap at k_min) ≈ ln(gap_history values)
+            # gap values are in [1e-6, ~10], so a is in [-14, +2.3] — always safe
+            gap_at_k_min = math.exp(max(min(a, 50.0), -50.0))   # hard clamp as safety net
+
+            residuals = [abs(ys[i] - (a + b * xs[i])) for i in range(n)]
+            residual = sum(residuals) / n
+            non_monotone_fraction = non_monotone_count / max(n - 1, 1)
+            adjusted_residual = residual * (1.0 + 2.0 * non_monotone_fraction)
+
+            # Return lam and gap_at_k_min along with k_min for use in prediction
+            return lam, gap_at_k_min, adjusted_residual, k_min
+        
+        def fit_linear_model(gap_history):
+            """Weighted linear rate fallback. Returns float or None."""
+            if len(gap_history) < 2:
+                return None
+            wsum, wtot = 0.0, 0.0
+            for i in range(1, len(gap_history)):
+                p0, g0, _ = gap_history[i - 1]
+                p1, g1, _ = gap_history[i]
+                dp = max(p1 - p0, 1)
+                dg = g0 - g1
+                if dg > 1e-9:
+                    w = 3.0 if i >= len(gap_history) - 1 else (
+                        2.0 if i >= len(gap_history) - 2 else 1.0
+                    )
+                    wsum += w * (dg / dp)
+                    wtot += w
+            return (wsum / wtot) if wtot > 0 else None
+
+        def predict_pixels_to_flip(cur_gap, lam, gap_at_k_min, k_min, k_cur):
+            """
+            From current state, how many more pixels until gap reaches ~0?
+            Uses cur_gap as the anchor (not stale k_min/gap_at_k_min),
+            so the estimate converges as progress is made.
+            gap(k_cur + delta) = cur_gap * exp(-lam * delta) = FLIP_THRESHOLD
+            => delta = ln(cur_gap / FLIP_THRESHOLD) / lam
+            """
+            if lam <= 1e-10:
+                return float('inf')
+            FLIP_THRESHOLD = 0.01
+            if cur_gap <= FLIP_THRESHOLD:
+                return 1.0
+            delta = math.log(cur_gap / FLIP_THRESHOLD) / lam
+            return max(delta, 1.0)
+        
+        def get_batch(k_cur, cur_gap, last_batch_time):
+            nonlocal is_first_cycle
+            if is_first_cycle:
+                is_first_cycle = False
+                return CALIBRATION_BATCH
+
+            time_remaining = deadline - 0.5 - time.perf_counter()
+            if time_remaining <= 0:
+                return 1
+
+            gap_fraction = cur_gap / max(gap_initial, 1e-8)
+
+            # ── Model fitting ─────────────────────────────────────────
+            fit_result = fit_decay_model(gap_history)
+            # fit_decay_model now returns 4 values
+            if fit_result[0] is not None:
+                lam, gap_at_k_min, exp_residual, k_min_fit = fit_result
+            else:
+                lam, gap_at_k_min, exp_residual, k_min_fit = None, None, float('inf'), 0
+
+            linear_rate = fit_linear_model(gap_history)
+
+            use_exponential = (
+                lam is not None and
+                lam > 1e-8 and
+                exp_residual < 0.15 and
+                len(gap_history) >= 3
+            )
+
+            if use_exponential:
+                pixels_needed = predict_pixels_to_flip(
+                    cur_gap, lam, gap_at_k_min, k_min_fit, k_cur
+                )
+                model_name = "exp"
+                natural_batch = max(1, int(0.0513 / lam))
+            elif linear_rate is not None and linear_rate > 1e-9:
+                pixels_needed = cur_gap / linear_rate
+                model_name = "linear"
+                natural_batch = None
+            else:
+                pixels_needed = max(k_est - k_cur, 1.0)
+                model_name = "fallback"
+                natural_batch = None
+
+            # ── Time budget ───────────────────────────────────────────
+            # last_batch_time = cost of one full cycle (gradient + selection)
+            # This is the direct measurement, not an estimate
+            cost_per_cycle = max(last_batch_time, 0.02)
+            cycles_remaining = time_remaining / cost_per_cycle
+
+            # NEW
+            # pace_batch = pixels this cycle must deliver to finish on time
+            # = pixels_needed spread evenly across remaining cycles
+            pace_batch = max(1, int(math.ceil(pixels_needed / max(cycles_remaining, 1.0))))
+
+            # time_ratio = pace_batch / natural_batch
+            # > 1: behind pace (need bigger batches than natural)
+            # < 1: ahead of pace (natural batch is fine)
+            if natural_batch is not None:
+                time_ratio = pace_batch / max(natural_batch, 1)
+            else:
+                time_ratio = 1.0
+
+            if use_exponential and lam > 1e-10:
+                natural_batch = max(1, int(0.0513 / lam))
+                if time_ratio <= 1.0:
+                    batch = natural_batch
+                else:
+                    # Scale up proportionally to how far behind we are
+                    batch = max(natural_batch, int(math.ceil(natural_batch * time_ratio)))
+            else:
+                # Linear or fallback: just use pace directly
+                batch = pace_batch
+
+            # Hard floor: pace_batch is the minimum required to finish in time.
+            # natural_batch or time_ratio logic may produce a smaller value when
+            # last_batch_time was stale or lam is small — this guarantees we
+            # never fall below the pace required to reach the flip before deadline.
+            batch = max(batch, pace_batch)
+
+            # ── Near-boundary precision: rate-derived, never arbitrary ─
+            # When gap is small, compute maximum batch such that
+            # the expected gap after this batch stays > 0 with margin.
+            # If batch is too large, we skip over the boundary without detecting flip.
+            if gap_fraction < 0.05 and use_exponential and lam > 1e-10:
+                # Only cap when truly near boundary (gap < 5% of initial)
+                # Allow up to 80% gap reduction per batch
+                max_overshoot_batch = max(1, int(1.609 / lam))
+                batch = min(batch, max_overshoot_batch)
+            elif gap_fraction < 0.05 and linear_rate is not None and linear_rate > 1e-9:
+                max_drop_batch = max(1, int(cur_gap * 0.80 / linear_rate))
+                batch = min(batch, max_drop_batch)
+
+            if len(gap_history) >= 3:
+                recent = gap_history[-3:]
+                non_mono = sum(
+                    1 for i in range(1, len(recent))
+                    if recent[i][1] >= recent[i-1][1]
+                )
+                if non_mono >= 2:
+                    batch = max(1, batch // 2)
+
+            batch = max(batch, 1)
+
+
+            lam_str = f"{lam:.2e}" if lam else "None"
+            residual_str = (
+                f"{exp_residual:.3f}"
+                if exp_residual != float("inf")
+                else "inf"
+            )
+            logger.info(
+                f"[GET_BATCH] batch={batch} gap={cur_gap:.4f} frac={gap_fraction:.3f} "
+                f"model={model_name} lam={lam_str} residual={residual_str} "
+                f"pixels_needed={int(pixels_needed)} pace={pace_batch} "
+                f"natural={natural_batch if natural_batch is not None else 'N/A'} "
+                f"time_ratio={time_ratio:.3f} time_left={time_remaining:.2f}"
+            )
+            return batch
+
         def check_flip(adv_float):
             """Verify flip on uint8-roundtripped image."""
             snapped = (adv_float * 255.0).round().clamp(0, 255) / 255.0
@@ -660,107 +860,89 @@ class PerturbMiner:
                     self.model, snapped.unsqueeze(0)
                 ).squeeze(0)
                 pred = int(lg_s.argmax().item())
-                margin = (lg_s[true_idx] - lg_s.topk(2).values[1]).item()
+                margin = (lg_s[true_idx] - lg_s[pred]).item()
             return pred != true_idx, margin, snapped
- 
-        def get_batch(k_cur, cur_gap, refresh_interval_seconds):
-            progress  = k_cur / max(k_est, 1)
-            gap_ratio = max(cur_gap, 0.0) / max(gap_initial, 1e-8)
 
-            time_remaining   = deadline - 1.5 - time.perf_counter()
-            pixels_remaining = max(k_est - k_cur, 1)
-
-            # Correct iters_remaining: how many gradient refreshes left
-            refreshes_left = time_remaining / max(refresh_interval_seconds, 0.05)
-            min_batch = int(pixels_remaining / max(refreshes_left, 1))
-
-            # Near-boundary precision cap
-            # When gap_ratio < 0.15, model is close to flipping — be precise
-            if gap_ratio < 0.05:
-                precision_cap = 2
-            elif gap_ratio < 0.15:
-                precision_cap = 5
-            elif gap_ratio < 0.3:
-                precision_cap = 15
-            else:
-                precision_cap = 9999  # no cap
-
-            # Near-completion precision cap
-            # When progress > 0.95, slow down
-            if progress > 0.95:
-                progress_cap = 3
-            elif progress > 0.85:
-                progress_cap = 10
-            else:
-                progress_cap = 9999
-
-            effective_cap = min(precision_cap, progress_cap)
-            result = max(min_batch, 5)           # floor: always at least 5
-            result = min(result, effective_cap)  # ceiling from precision
-            result = max(result, min_batch)      # but never starve time budget
-            logger.info(f"[GET_BATCH] batch_count={result} current_gap={cur_gap} progress={progress} gap_ratio={gap_ratio}")
-            return result
-
- 
-        REFRESH_INTERVAL = 50
-        refresh_interval_seconds = 0.2  # initial guess
-        last_refresh_wall = time.perf_counter()
-        g_cur = None
+        current_adv = clean.clone()
+        selected = []                                        # pixel indices
+        selected_mask = torch.zeros(N, dtype=torch.bool, device=self.device)
+        selected_signs = torch.zeros(N, dtype=torch.long, device=self.device)
+        best_result = None
+        gap_initial = gap
         cur_gap = gap
-        last_refresh_count = -REFRESH_INTERVAL
-        while len(selected) < int(k_est * 3):
-            if time.perf_counter() > deadline - 1.5:
-                break
- 
-            # Gradient refresh at current adversarial state
-            if len(selected) - last_refresh_count >= REFRESH_INTERVAL:
-                now = time.perf_counter()
-                measured = now - last_refresh_wall
-                if measured < 5.0 and last_refresh_count >= 0:
-                    refresh_interval_seconds = 0.7 * refresh_interval_seconds + 0.3 * measured
-                last_refresh_wall = now
-                last_refresh_count = len(selected)
-                # do gradient refresh ...
-                x_in = current_adv.detach().requires_grad_(True)
-                lg_in = logits_for_images(
-                    self.model, x_in.unsqueeze(0)
-                ).squeeze(0)
-    
-                if x_in.grad is not None:
-                    x_in.grad.zero_()
-                lg_in[true_idx].backward(retain_graph=True)
-                g_true_cur = x_in.grad.detach().reshape(-1).clone()
-    
-                if x_in.grad is not None:
-                    x_in.grad.zero_()
-                lg_in[target_idx].backward()
-                g_tgt_cur = x_in.grad.detach().reshape(-1).clone()
-    
-                g_cur = g_true_cur - g_tgt_cur
-    
-                with torch.no_grad():
-                    cur_gap = (
-                        lg_in[true_idx] - lg_in.topk(2).values[1]
-                    ).item()
-                if cur_gap <= 0:
-                    flipped, margin, snapped = check_flip(current_adv)
-                    if flipped:
-                        if best_result is None or len(selected) < best_result["k"]:
-                            with torch.no_grad():
-                                pred_now = int(
-                                    logits_for_images(
-                                        self.model, snapped.unsqueeze(0)
-                                    ).argmax().item()
-                                )
-                            best_result = {
-                                "image":    snapped.clone(),
-                                "k":        len(selected),
-                                "margin":   margin,
-                                "selected": selected.copy(),
-                                "pred":     pred_now,
-                            }
-                        break
+        g_t = best_target["gradient"]
+        g_norm1 = g_t.abs().sum().item()
+        lambda_prior = (eps * g_norm1) / (gap_initial * N)
 
+        CALIBRATION_BATCH = max(5, int(0.10 / max(lambda_prior, 1e-8)))
+        CALIBRATION_BATCH = min(CALIBRATION_BATCH, 200)
+        is_first_cycle = True
+
+        gap_history = [(0, gap_initial, time.perf_counter())]
+        last_batch_time = 0.20
+        while True:
+            if time.perf_counter() > deadline - 0.5:
+                break
+            cycle_start = time.perf_counter()
+            x_in = current_adv.detach().requires_grad_(True)
+            lg_in = logits_for_images(self.model, x_in.unsqueeze(0)).squeeze(0)
+
+            if x_in.grad is not None:
+                x_in.grad.zero_()
+            lg_in[true_idx].backward(retain_graph=True)
+            g_true_cur = x_in.grad.detach().reshape(-1).clone()
+    
+            if x_in.grad is not None:
+                x_in.grad.zero_()
+            lg_in[target_idx].backward()
+            g_tgt_cur = x_in.grad.detach().reshape(-1).clone()
+    
+            g_cur = g_true_cur - g_tgt_cur
+            
+            with torch.no_grad():
+                cur_gap = (
+                    lg_in[true_idx] - lg_in.topk(2).values[1]
+                ).item()
+            
+            gap_history.append((len(selected), max(cur_gap, 1e-6), time.perf_counter()))
+            if len(gap_history) > 12:
+                gap_history.pop(0)
+            # NEW
+            if cur_gap < 2.0:
+                _flipped, _margin, _snapped = check_flip(current_adv)
+                if _flipped:
+                    _, flip_q = _quality_on_png(
+                        self.model, clean, _snapped, true_idx, true_idx
+                    )
+                    preflight = _preflight_flip_only(flip_q, true_idx, challenge_epsilon)
+                    if preflight.ok and (best_result is None or flip_q.rmse < best_result.get("rmse_val", float("inf"))):
+                        pred_now = int(flip_q.pred)
+                        flip_score = _estimate_validator_score(
+                            flip_q,
+                            true_idx,
+                            challenge_epsilon,
+                            (time.perf_counter() - attack_t0) * 1000.0,
+                            timeout_seconds,
+                        )
+                        best_result = {
+                            "image":    _snapped.clone(),
+                            "k":        len(selected),
+                            "margin":   _margin,
+                            "selected": selected.copy(),
+                            "pred":     pred_now,
+                            "rmse_val": flip_q.rmse,
+                        }
+                        log_attack(
+                            f"[FLIP] k={len(selected)} margin={_margin:.3f}",
+                            prediction=pred_now,
+                            rmse=flip_q.rmse,
+                            norm=flip_q.norm,
+                            estimated_score=flip_score,
+                        )
+                        if flip_score > 0:
+                            break
+
+            batch_size = get_batch(len(selected), cur_gap, last_batch_time)
             # Scores for this step
             flat_cur = current_adv.reshape(-1)
             sc = (g_cur * flat_cur).abs()
@@ -778,7 +960,6 @@ class PerturbMiner:
  
             if sc.max() <= 0:
                 break
-            batch_size = get_batch(len(selected), cur_gap, refresh_interval_seconds)
             n_pick = min(batch_size, int(valid_cur.sum().item()))
             if n_pick == 0:
                 break
@@ -793,45 +974,29 @@ class PerturbMiner:
             current_adv = flat_u8.reshape(C, H, W).float() / 255.0
 
             # Update selected list and mask
-            selected.extend(top_idx.tolist())          # one .tolist() call not N
-            selected_mask[top_idx] = True              # vectorized mask update
- 
+            selected.extend(top_idx.tolist())
+            selected_mask[top_idx] = True
+            selected_signs[top_idx] = s_vec
+            last_batch_time = max(time.perf_counter() - cycle_start, 0.02)
             # Flip check on uint8 roundtrip
-            flipped, margin, snapped = check_flip(current_adv)
-            if flipped and margin < -0.4:
-                if best_result is None or len(selected) < best_result["k"]:
-                    with torch.no_grad():
-                        pred_now = int(
-                            logits_for_images(
-                                self.model, snapped.unsqueeze(0)
-                            ).argmax().item()
-                        )
-                    best_result = {
-                        "image":    snapped.clone(),
-                        "k":        len(selected),
-                        "margin":   margin,
-                        "selected": selected.copy(),
-                        "pred":     pred_now,
-                    }
-                    _, flip_q = _quality_on_png(
-                        self.model, clean, snapped, true_idx, true_idx
+            # Flip check on uint8 roundtrip
+            if best_result is None:
+                _flipped2, _margin2, _snapped2 = check_flip(current_adv)
+                if _flipped2:
+                    _, flip_q2 = _quality_on_png(
+                        self.model, clean, _snapped2, true_idx, true_idx
                     )
-                    flip_score = _estimate_validator_score(
-                        flip_q,
-                        true_idx,
-                        challenge_epsilon,
-                        (time.perf_counter() - attack_t0) * 1000.0,
-                        timeout_seconds,
-                    )
-                    log_attack(
-                        f"[FLIP] k={len(selected)} margin={margin:.3f}",
-                        prediction=pred_now,
-                        rmse=flip_q.rmse,
-                        norm=flip_q.norm,
-                        estimated_score=flip_score,
-                    )
-                if margin < -1.0:   # deep enough — stop early
-                    break
+                    preflight2 = _preflight_flip_only(flip_q2, true_idx, challenge_epsilon)
+                    if preflight2.ok:
+                        best_result = {
+                            "image":    _snapped2.clone(),
+                            "k":        len(selected),
+                            "margin":   _margin2,
+                            "selected": selected.copy(),
+                            "pred":     int(flip_q2.pred),
+                            "rmse_val": flip_q2.rmse,
+                        }
+
         if best_result is None:
             logger.warning(
                 f"[ATTACK] No flip found after {len(selected)} pixels"
@@ -841,30 +1006,37 @@ class PerturbMiner:
         # ── Phase 4: backward elimination ─────────────────────────────────
         elim_budget = min(1.2, deadline - time.perf_counter() - 0.3)
         elim_deadline = time.perf_counter() + elim_budget
- 
+        # Store actual sign used when pixel was selected
         sel = best_result["selected"].copy()
         curr = best_result["image"].clone()
- 
+
         def still_flips(adv_float):
-            sn = (adv_float * 255.0).round().clamp(0, 255) / 255.0
+            try:
+                decoded = _encode_decode_roundtrip(adv_float)
+            except Exception:
+                decoded = (adv_float * 255.0).round().clamp(0, 255) / 255.0
             with torch.no_grad():
                 lg2 = logits_for_images(
-                    self.model, sn.unsqueeze(0)
+                    self.model, decoded.unsqueeze(0)
                 ).squeeze(0)
-                marg = (lg2[true_idx] - lg2.topk(2).values[1]).item()
-            return lg2.argmax().item() != true_idx and marg < -0.4
- 
+                pred2 = int(lg2.argmax().item())
+                marg = (lg2[true_idx] - lg2[pred2]).item()
+            if lg2.argmax().item() == true_idx:
+                return False
+            q = _measure_adv_quality(self.model, clean, decoded, true_idx, true_idx)
+            return _preflight_flip_only(q, true_idx, challenge_epsilon).ok
+
         def apply_sel(sel_list):
             """Rebuild adversarial image from selection list."""
-            base = (clean * 255.0).round().clamp(0, 255)
+            base = (clean * 255.0).round().clamp(0, 255).long()
             flat_b  = base.reshape(-1)
-            for px in sel_list:
-                s = int(signs[px].item())
-                flat_b[px] = (flat_b[px] + s).clamp(0, 255)
-            return flat_b.reshape(C, H, W) / 255.0
+            sel_t = torch.tensor(sel_list, dtype=torch.long, device=self.device)
+            s = selected_signs[sel_t]          # actual signs used at selection time
+            flat_b[sel_t] = (flat_b[sel_t] + s).clamp(0, 255)
+            return flat_b.reshape(C, H, W).float() / 255.0
  
         improved = True
-        logger.info(f"[ELIM] k_initial={len(sel)} elim_deadline={elim_deadline}")
+        logger.info(f"[ELIM] k_initial={len(sel)} elim_budget={elim_budget}")
         while improved and time.perf_counter() < elim_deadline:
             improved = False
  
