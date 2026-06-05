@@ -717,16 +717,13 @@ class PerturbMiner:
             return (wsum / wtot) if wtot > 0 else None
 
         def predict_pixels_to_flip(cur_gap, lam, gap_at_k_min, k_min, k_cur):
-            """
-            From current state, how many more pixels until gap reaches ~0?
-            Uses cur_gap as the anchor (not stale k_min/gap_at_k_min),
-            so the estimate converges as progress is made.
-            gap(k_cur + delta) = cur_gap * exp(-lam * delta) = FLIP_THRESHOLD
-            => delta = ln(cur_gap / FLIP_THRESHOLD) / lam
-            """
             if lam <= 1e-10:
                 return float('inf')
-            FLIP_THRESHOLD = 0.01
+            # Threshold must be truly 0 (flip boundary).
+            # Use 0.001 — well below where check_flip triggers,
+            # so pixels_needed stays non-zero until we're truly at boundary.
+            # Scaling with gap_initial caused underestimation for large-gap images.
+            FLIP_THRESHOLD = 0.001
             if cur_gap <= FLIP_THRESHOLD:
                 return 1.0
             delta = math.log(cur_gap / FLIP_THRESHOLD) / lam
@@ -887,27 +884,34 @@ class PerturbMiner:
             x_in = current_adv.detach().requires_grad_(True)
             lg_in = logits_for_images(self.model, x_in.unsqueeze(0)).squeeze(0)
 
-            if x_in.grad is not None:
-                x_in.grad.zero_()
+            # Compute gap from the SAME forward pass — no extra forward needed
+            with torch.no_grad():
+                cur_gap = (lg_in[true_idx] - lg_in.topk(2).values[1]).item()
+
+            # Two backward passes sharing the same retained graph
             lg_in[true_idx].backward(retain_graph=True)
             g_true_cur = x_in.grad.detach().reshape(-1).clone()
-    
-            if x_in.grad is not None:
-                x_in.grad.zero_()
+
+            x_in.grad.zero_()
             lg_in[target_idx].backward()
             g_tgt_cur = x_in.grad.detach().reshape(-1).clone()
-    
+
             g_cur = g_true_cur - g_tgt_cur
-            
-            with torch.no_grad():
-                cur_gap = (
-                    lg_in[true_idx] - lg_in.topk(2).values[1]
-                ).item()
             
             gap_history.append((len(selected), max(cur_gap, 1e-6), time.perf_counter()))
             if len(gap_history) > 12:
                 gap_history.pop(0)
-            # NEW
+
+            # If we've applied 1.5x k_est pixels with no flip,
+            # gap is stuck (diminishing returns on current target).
+            # Break to avoid wasting remaining budget on exhausted pixels.
+            if len(selected) > k_est * 1.5 and best_result is None and cur_gap > 0.05:
+                logger.warning(
+                    f"[ATTACK] Exceeded 1.5x k_est={k_est} at k={len(selected)} "
+                    f"gap={cur_gap:.4f} — stopping, greedy exhausted"
+                )
+                break
+
             if cur_gap < 2.0:
                 _flipped, _margin, _snapped = check_flip(current_adv)
                 if _flipped:
@@ -939,13 +943,13 @@ class PerturbMiner:
                             norm=flip_q.norm,
                             estimated_score=flip_score,
                         )
-                        if flip_score > 0:
+                        if flip_q.rmse < 0.3 * _VAL_MAX_LINF:
                             break
 
             batch_size = get_batch(len(selected), cur_gap, last_batch_time)
             # Scores for this step
             flat_cur = current_adv.reshape(-1)
-            sc = (g_cur * flat_cur).abs()
+            sc = g_cur.abs()
             sc[selected_mask] = 0.0
  
             # Direction validity at current state
@@ -964,7 +968,46 @@ class PerturbMiner:
             if n_pick == 0:
                 break
 
-            top_idx = torch.topk(sc, n_pick).indices
+            # ── Near-boundary: direct Δgap measurement per candidate ──────
+            # When gap is tiny and batch is small, the gradient ranking can
+            # misorder the last few pixels. Directly measuring actual gap delta
+            # per forward pass finds the minimum-k flip path.
+            # Cost: n_measure × 1 forward pass. Only runs when it matters.
+            if cur_gap < 0.05 and n_pick <= 5:
+                try:
+                    _n_direct = min(n_pick * 6, 30)
+                    _direct_cands = torch.topk(sc, min(_n_direct, int((sc > 0).sum().item()))).indices
+                    if len(_direct_cands) >= n_pick:
+                        _base_u8 = (current_adv * 255.0).round().clamp(0, 255).long()
+                        with torch.no_grad():
+                            _lg_base = logits_for_images(self.model, current_adv.unsqueeze(0)).squeeze(0)
+                            _gap_base = (_lg_base[true_idx] - _lg_base[target_idx]).item()
+                        _delta_gaps = []
+                        for _ci in _direct_cands.tolist():
+                            _test_u8 = _base_u8.clone()
+                            _flat_test = _test_u8.reshape(-1)
+                            # Use the boundary gradient sign for this pixel
+                            _sign = -int(g_cur[_ci].sign().item())
+                            if _sign == 0:
+                                _sign = 1
+                            _flat_test[_ci] = (_flat_test[_ci] + _sign).clamp(0, 255)
+                            _test_img = _flat_test.reshape(C, H, W).float() / 255.0
+                            with torch.no_grad():
+                                _lg_t = logits_for_images(self.model, _test_img.unsqueeze(0)).squeeze(0)
+                                _dgap = (_lg_t[true_idx] - _lg_t[target_idx]).item() - _gap_base
+                            _delta_gaps.append((_ci, _dgap))
+                        # Most negative Δgap = most gap reduction = best pixel
+                        _delta_gaps.sort(key=lambda z: z[1])
+                        top_idx = torch.tensor(
+                            [z[0] for z in _delta_gaps[:n_pick]],
+                            dtype=torch.long, device=self.device
+                        )
+                    else:
+                        top_idx = torch.topk(sc, n_pick).indices
+                except Exception:
+                    top_idx = torch.topk(sc, n_pick).indices
+            else:
+                top_idx = torch.topk(sc, n_pick).indices
 
             # Vectorized — replaces entire for loop
             s_vec = signs_cur[top_idx].long()          # signs for selected pixels
@@ -977,8 +1020,7 @@ class PerturbMiner:
             selected.extend(top_idx.tolist())
             selected_mask[top_idx] = True
             selected_signs[top_idx] = s_vec
-            last_batch_time = max(time.perf_counter() - cycle_start, 0.02)
-            # Flip check on uint8 roundtrip
+            last_batch_time = 0.7 * last_batch_time + 0.3 * max(time.perf_counter() - cycle_start, 0.02)
             # Flip check on uint8 roundtrip
             if best_result is None:
                 _flipped2, _margin2, _snapped2 = check_flip(current_adv)
