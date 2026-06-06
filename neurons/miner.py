@@ -184,7 +184,7 @@ _MARGINAL_PROBE_ENABLED = os.getenv("MINER_MARGINAL_PROBE_ENABLED", "1").strip()
 _BATCH_EFFICIENCY_TOL = float(os.getenv("MINER_BATCH_EFFICIENCY_TOL", "0.88"))
 
 # Safety-grow should not use very large batches because it only needs margin buffer.
-_MAX_SAFETY_GROW_BATCH = int(os.getenv("MINER_MAX_SAFETY_GROW_BATCH", "24"))
+_MAX_SAFETY_GROW_BATCH = int(os.getenv("MINER_MAX_SAFETY_GROW_BATCH", "32"))
 
 # ── Adaptive doubling + trust-region refinement ───────────────────────────
 # Coarse doubling finds the useful batch region.
@@ -208,9 +208,9 @@ _MIN_PROGRESS_FAR = float(os.getenv("MINER_MIN_PROGRESS_FAR", "0.15"))
 _MIN_PROGRESS_MID = float(os.getenv("MINER_MIN_PROGRESS_MID", "0.20"))
 _MIN_PROGRESS_NEAR = float(os.getenv("MINER_MIN_PROGRESS_NEAR", "0.30"))
 
-_FLIP_MARGIN_EPS      = float(os.getenv("MINER_FLIP_MARGIN_EPS", "-0.015"))
-_STRONG_SAFE_MARGIN   = float(os.getenv("MINER_STRONG_SAFE_MARGIN", "-0.03"))
-_SAFETY_GROW_TARGET   = float(os.getenv("MINER_SAFETY_GROW_TARGET", "-0.02"))
+_FLIP_MARGIN_EPS      = float(os.getenv("MINER_FLIP_MARGIN_EPS", "-0.020"))
+_STRONG_SAFE_MARGIN   = float(os.getenv("MINER_STRONG_SAFE_MARGIN", "-0.050"))
+_SAFETY_GROW_TARGET   = float(os.getenv("MINER_SAFETY_GROW_TARGET", "-0.035"))
 _NEAR_BOUNDARY_GAP    = float(os.getenv("MINER_NEAR_BOUNDARY_GAP", "0.03"))
 _TARGET_SWITCH_STEPS  = int(os.getenv("MINER_TARGET_SWITCH_STEPS", "8"))
 # Match the validator's numerics by disabling TF32 reductions on the miner so
@@ -1492,27 +1492,14 @@ class PerturbMiner:
                 )
             best_result = best_hard_result
 
-        if best_result is None and best_soft_result is not None:
+        # Do NOT submit soft/progress candidates.
+        # Validator rejects these as label_match_with_original when the margin is too close to zero.
+        if best_result is None:
             logger.warning(
-                f"[FALLBACK_SOFT] k={best_soft_result['k']} "
-                f"margin={best_soft_result['margin']:.5f} — no hard flip, using soft"
+                "[NO_HARD_FLIP] No validator-safe hard flip found; returning None instead of soft/progress candidate"
             )
-            log_attack(
-                f"[FALLBACK_SOFT] k={best_soft_result['k']} "
-                f"margin={best_soft_result['margin']:.5f}"
-            )
-            best_result = best_soft_result
-
-        if best_result is None and best_progress_result is not None:
-            logger.warning(
-                f"[FALLBACK_PROGRESS] k={best_progress_result['k']} "
-                f"gap={best_progress_gap:.4f} — returning best attempted perturbation"
-            )
-            log_attack(
-                f"[FALLBACK_PROGRESS] k={best_progress_result['k']} "
-                f"gap={best_progress_gap:.4f}"
-            )
-            best_result = best_progress_result
+            log_attack("[NO_HARD_FLIP] no validator-safe hard flip")
+            return None
 
         if best_result is None:
             if len(selected) == 0:
@@ -1525,23 +1512,6 @@ class PerturbMiner:
             log_attack(f"[ATTACK] No hard flip after {len(selected)} pixels")
             return None
 
-        # Only proceed to elimination if we have a hard flip candidate.
-        if not _is_hard_flip(float(best_result["margin"])):
-            logger.info(
-                f"[SKIP_ELIM] margin={best_result['margin']:.5f} not hard-safe "
-                f"— returning best available candidate"
-            )
-            _, final_q = _quality_on_png(
-                self.model, clean, best_result["image"], true_idx, true_idx
-            )
-            return {
-                "image":  best_result["image"],
-                "k":      best_result["k"],
-                "rmse":   final_q.rmse,
-                "norm":   final_q.norm,
-                "margin": float(final_q.margin),
-                "pred":   int(final_q.pred),
-            }
         # ── Phase 4: backward elimination ─────────────────────────────────
         # Use all reserved time for elimination.
         elim_budget = max(0.0, final_deadline - time.perf_counter())
@@ -1729,6 +1699,21 @@ class PerturbMiner:
             norm=final_q.norm,
             estimated_score=final_score,
         )
+        final_preflight = _preflight_flip_only(final_q, true_idx, challenge_epsilon)
+        if not final_preflight.ok:
+            logger.warning(
+                f"[FINAL_BLOCKED] reason={final_preflight.reason} "
+                f"pred={final_q.pred} margin={final_q.margin:.5f} "
+                f"rmse={final_q.rmse:.2e} norm={final_q.norm:.6f}"
+            )
+            log_attack(
+                f"[FINAL_BLOCKED] reason={final_preflight.reason} margin={final_q.margin:.5f}",
+                prediction=final_q.pred,
+                rmse=final_q.rmse,
+                norm=final_q.norm,
+                estimated_score=0.0,
+            )
+            return None
         return {
             "image":  curr,
             "k":      k_final,
