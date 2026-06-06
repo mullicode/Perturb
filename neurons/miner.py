@@ -1145,7 +1145,7 @@ class PerturbMiner:
             if len(sel_snapshot) == 0:
                 return
 
-            _, flip_q = _quality_on_png(
+            flip_q = _measure_adv_quality(
                 self.model, clean, snapped, true_idx, true_idx
             )
             cand = {
@@ -1550,7 +1550,7 @@ class PerturbMiner:
         logger.info(f"[ELIM] k_initial={best_result['k']} elim_budget={elim_budget:.3f}")
         sel = best_result["selected"].copy()
         curr = best_result["image"].clone()
-        
+
         def rebuild(sel_list):
             base = (clean * 255.0).round().clamp(0, 255).long()
             flat_b = base.reshape(-1)
