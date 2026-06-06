@@ -206,9 +206,9 @@ _TRUST_REGION_COLLAPSE_RATIO = float(os.getenv("MINER_TRUST_REGION_COLLAPSE_RATI
 _MIN_PROGRESS_FAR = float(os.getenv("MINER_MIN_PROGRESS_FAR", "0.15"))
 _MIN_PROGRESS_MID = float(os.getenv("MINER_MIN_PROGRESS_MID", "0.20"))
 _MIN_PROGRESS_NEAR = float(os.getenv("MINER_MIN_PROGRESS_NEAR", "0.30"))
-_FLIP_MARGIN_EPS      = float(os.getenv("MINER_FLIP_MARGIN_EPS", "-0.0005"))
-_STRONG_SAFE_MARGIN   = float(os.getenv("MINER_STRONG_SAFE_MARGIN", "-0.0015"))
-_SAFETY_GROW_TARGET   = float(os.getenv("MINER_SAFETY_GROW_TARGET", "-0.0010"))
+_FLIP_MARGIN_EPS      = float(os.getenv("MINER_FLIP_MARGIN_EPS", "-0.0030"))
+_STRONG_SAFE_MARGIN   = float(os.getenv("MINER_STRONG_SAFE_MARGIN", "-0.0040"))
+_SAFETY_GROW_TARGET   = float(os.getenv("MINER_SAFETY_GROW_TARGET", "-0.0030"))
 _NEAR_BOUNDARY_GAP    = float(os.getenv("MINER_NEAR_BOUNDARY_GAP", "0.03"))
 _TARGET_SWITCH_STEPS  = int(os.getenv("MINER_TARGET_SWITCH_STEPS", "8"))
 # Match the validator's numerics by disabling TF32 reductions on the miner so
@@ -586,7 +586,11 @@ class PerturbMiner:
 
         true_logit = lg[true_idx]
         gap = (true_logit - lg.topk(2).values[1]).item()
-        logger.info(f"[PROBE] true={true_idx} gap={gap:.3f} N={N}")
+        logger.info(
+            f"[THRESHOLDS] flip_margin_eps={_FLIP_MARGIN_EPS:.6f} "
+            f"strong_safe_margin={_STRONG_SAFE_MARGIN:.6f} "
+            f"safety_grow_target={_SAFETY_GROW_TARGET:.6f}"
+        )
         log_attack(f"[PROBE] true={true_idx} gap={gap:.3f} N={N}")
         # Top-20 candidate target classes by logit (excluding true class)
         top_classes = lg.detach().argsort(descending=True)
@@ -914,8 +918,9 @@ class PerturbMiner:
             def _probe_one_k(k_probe: int, top_pool: torch.Tensor) -> dict:
                 """
                 Probe one exact k from the same top_pool.
-                This is used to search inside coarse intervals like:
-                1024..2048, 2048..4096, etc.
+
+                This must use PNG-roundtrip + hard margin, otherwise fine search can
+                choose a borderline local flip that validator later sees as label_match.
                 """
                 k_probe = int(max(1, min(k_probe, int(top_pool.numel()))))
 
@@ -929,6 +934,11 @@ class PerturbMiner:
 
                 test_img = flat_test.reshape(C, H, W).float() / 255.0
 
+                try:
+                    test_img = _encode_decode_roundtrip(test_img)
+                except Exception:
+                    test_img = (test_img * 255.0).round().clamp(0, 255) / 255.0
+
                 with torch.no_grad():
                     lg_t = logits_for_images(
                         self.model, test_img.unsqueeze(0)
@@ -941,12 +951,15 @@ class PerturbMiner:
                     gap_t = float(lg_t[true_idx].item() - lg_t[best_other_t].item())
                     pred_t = int(lg_t.argmax().item())
 
+                soft_flipped = pred_t != true_idx or gap_t < 0.0
+                hard_flipped = pred_t != true_idx and gap_t <= _FLIP_MARGIN_EPS
+
                 return {
                     "k": k_probe,
                     "gap": gap_t,
-                    "flipped": pred_t != true_idx or gap_t < 0.0,
+                    "flipped": hard_flipped,
+                    "soft_flipped": soft_flipped,
                 }
-
 
             def _fine_search_first_flip(
                 *,
@@ -1001,7 +1014,7 @@ class PerturbMiner:
 
                 dense_flips = [
                     r for r in dense_results
-                    if r["flipped"] or r["gap"] < 0.0
+                    if r.get("flipped", False)
                 ]
 
                 if dense_flips:
@@ -1024,7 +1037,7 @@ class PerturbMiner:
                     mid = (lo + hi) // 2
                     r_mid = _probe_one_k(mid, top_pool)
 
-                    if r_mid["flipped"] or r_mid["gap"] < 0.0:
+                    if r_mid.get("flipped", False):
                         best_k = mid
                         hi = mid - 1
                     else:
@@ -1396,7 +1409,7 @@ class PerturbMiner:
         is_first_cycle = True
 
         gap_history = [(0, gap_initial, time.perf_counter())]
-        ELIM_RESERVE = float(os.getenv("MINER_ELIM_RESERVE", "2.6"))
+        ELIM_RESERVE = float(os.getenv("MINER_ELIM_RESERVE", "3.5"))
         FINAL_BUFFER = 0.25
         grow_deadline = deadline - ELIM_RESERVE
         final_deadline = deadline - FINAL_BUFFER
@@ -1651,7 +1664,7 @@ class PerturbMiner:
                 # Do not push to deep negative margin.
                 if _is_hard_flip(_margin2):
                     logger.info(
-                        f"[BOUNDARY_SAFE_FLIP] k={len(selected)} margin={_margin2:.6f} "
+                        f"[VALIDATOR_SAFE_FLIP] k={len(selected)} margin={_margin2:.6f} threshold={_FLIP_MARGIN_EPS:.6f} "
                         f"— stop growth and start elimination"
                     )
                     log_attack(
@@ -1682,9 +1695,10 @@ class PerturbMiner:
         # Validator rejects these as label_match_with_original when the margin is too close to zero.
         if best_result is None:
             logger.warning(
-                "[NO_HARD_FLIP] No validator-safe hard flip found; returning None instead of soft/progress candidate"
+                "[NO_HARD_FLIP] No PNG-safe hard flip found. "
+                "Returning None; validator may score this as label_match_with_original because no valid attack is available."
             )
-            log_attack("[NO_HARD_FLIP] no validator-safe hard flip")
+            log_attack("[NO_HARD_FLIP] no PNG-safe hard flip", estimated_score=0.0)
             return None
 
         if best_result is None:
