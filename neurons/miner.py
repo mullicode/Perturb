@@ -184,15 +184,14 @@ _MARGINAL_PROBE_ENABLED = os.getenv("MINER_MARGINAL_PROBE_ENABLED", "1").strip()
 _BATCH_EFFICIENCY_TOL = float(os.getenv("MINER_BATCH_EFFICIENCY_TOL", "0.88"))
 
 # Safety-grow should not use very large batches because it only needs margin buffer.
-_MAX_SAFETY_GROW_BATCH = int(os.getenv("MINER_MAX_SAFETY_GROW_BATCH", "32"))
-
+_MAX_SAFETY_GROW_BATCH = int(os.getenv("MINER_MAX_SAFETY_GROW_BATCH", "4"))
 # ── Adaptive doubling + trust-region refinement ───────────────────────────
 # Coarse doubling finds the useful batch region.
 # Refinement checks inside the good/bad interval, e.g. 512 good, 1024 weak
 # then test 640/768/896.
 _MAX_COARSE_PROBES = int(os.getenv("MINER_MAX_COARSE_PROBES", "5"))
-_MAX_REFINE_PROBES = int(os.getenv("MINER_MAX_REFINE_PROBES", "3"))
-_REFINE_TIME_MIN = float(os.getenv("MINER_REFINE_TIME_MIN", "1.75"))
+_MAX_REFINE_PROBES = int(os.getenv("MINER_MAX_REFINE_PROBES", "9"))
+_REFINE_TIME_MIN = float(os.getenv("MINER_REFINE_TIME_MIN", "0.75"))
 
 # Hard expansion cap. Stage limits are only the first trust-region range.
 # If the largest candidate is still efficient, the controller may expand upward.
@@ -207,10 +206,9 @@ _TRUST_REGION_COLLAPSE_RATIO = float(os.getenv("MINER_TRUST_REGION_COLLAPSE_RATI
 _MIN_PROGRESS_FAR = float(os.getenv("MINER_MIN_PROGRESS_FAR", "0.15"))
 _MIN_PROGRESS_MID = float(os.getenv("MINER_MIN_PROGRESS_MID", "0.20"))
 _MIN_PROGRESS_NEAR = float(os.getenv("MINER_MIN_PROGRESS_NEAR", "0.30"))
-
-_FLIP_MARGIN_EPS      = float(os.getenv("MINER_FLIP_MARGIN_EPS", "-0.020"))
-_STRONG_SAFE_MARGIN   = float(os.getenv("MINER_STRONG_SAFE_MARGIN", "-0.050"))
-_SAFETY_GROW_TARGET   = float(os.getenv("MINER_SAFETY_GROW_TARGET", "-0.035"))
+_FLIP_MARGIN_EPS      = float(os.getenv("MINER_FLIP_MARGIN_EPS", "-0.0005"))
+_STRONG_SAFE_MARGIN   = float(os.getenv("MINER_STRONG_SAFE_MARGIN", "-0.0015"))
+_SAFETY_GROW_TARGET   = float(os.getenv("MINER_SAFETY_GROW_TARGET", "-0.0010"))
 _NEAR_BOUNDARY_GAP    = float(os.getenv("MINER_NEAR_BOUNDARY_GAP", "0.03"))
 _TARGET_SWITCH_STEPS  = int(os.getenv("MINER_TARGET_SWITCH_STEPS", "8"))
 # Match the validator's numerics by disabling TF32 reductions on the miner so
@@ -912,6 +910,127 @@ class PerturbMiner:
                     })
 
                 return results, top_pool
+            
+            def _probe_one_k(k_probe: int, top_pool: torch.Tensor) -> dict:
+                """
+                Probe one exact k from the same top_pool.
+                This is used to search inside coarse intervals like:
+                1024..2048, 2048..4096, etc.
+                """
+                k_probe = int(max(1, min(k_probe, int(top_pool.numel()))))
+
+                base_u8 = (current_adv * 255.0).round().clamp(0, 255).long()
+                test_u8 = base_u8.clone()
+                flat_test = test_u8.reshape(-1)
+
+                idx = top_pool[:k_probe]
+                s = signs_cur[idx].long()
+                flat_test[idx] = (flat_test[idx] + s).clamp(0, 255)
+
+                test_img = flat_test.reshape(C, H, W).float() / 255.0
+
+                with torch.no_grad():
+                    lg_t = logits_for_images(
+                        self.model, test_img.unsqueeze(0)
+                    ).squeeze(0).float()
+
+                    comp_t = lg_t.clone()
+                    comp_t[true_idx] = float("-inf")
+                    best_other_t = int(comp_t.argmax().item())
+
+                    gap_t = float(lg_t[true_idx].item() - lg_t[best_other_t].item())
+                    pred_t = int(lg_t.argmax().item())
+
+                return {
+                    "k": k_probe,
+                    "gap": gap_t,
+                    "flipped": pred_t != true_idx or gap_t < 0.0,
+                }
+
+
+            def _fine_search_first_flip(
+                *,
+                top_pool: torch.Tensor,
+                results: list[dict],
+                chosen_flip: dict,
+            ) -> tuple[int, list[dict]]:
+                """
+                If coarse says 2048 flips, do not blindly return 2048.
+                Search inside previous non-flip -> first flip interval.
+
+                Example:
+                    1024 non-flip, 2048 flip
+                    test 1152,1280,1408,1536,1664,1792,1920
+                    then binary search smallest flipping k.
+                """
+                hi = int(chosen_flip["k"])
+
+                lower_nonflips = [
+                    int(r["k"])
+                    for r in results
+                    if int(r["k"]) < hi and not (r["flipped"] or r["gap"] < 0.0)
+                ]
+                lo = max(lower_nonflips) + 1 if lower_nonflips else 1
+
+                dense_results = []
+
+                interval = hi - lo + 1
+                if interval >= 2048:
+                    step = 128
+                elif interval >= 1024:
+                    step = 128
+                elif interval >= 512:
+                    step = 64
+                elif interval >= 256:
+                    step = 32
+                elif interval >= 128:
+                    step = 16
+                elif interval >= 64:
+                    step = 8
+                else:
+                    step = 4
+
+                # Dense scan first: 1152,1280,1408...
+                start_k = lo + step - ((lo - 1) % step)
+                k = start_k
+
+                while k < hi and (grow_deadline - time.perf_counter()) >= 0.25:
+                    r = _probe_one_k(k, top_pool)
+                    dense_results.append(r)
+                    k += step
+
+                dense_flips = [
+                    r for r in dense_results
+                    if r["flipped"] or r["gap"] < 0.0
+                ]
+
+                if dense_flips:
+                    first_dense_flip = min(dense_flips, key=lambda r: r["k"])
+                    hi = int(first_dense_flip["k"])
+
+                    dense_nonflips_below = [
+                        int(r["k"])
+                        for r in dense_results
+                        if int(r["k"]) < hi and not (r["flipped"] or r["gap"] < 0.0)
+                    ]
+
+                    if dense_nonflips_below:
+                        lo = max(dense_nonflips_below) + 1
+
+                # Binary search final interval.
+                best_k = hi
+
+                while lo <= hi and (grow_deadline - time.perf_counter()) >= 0.18:
+                    mid = (lo + hi) // 2
+                    r_mid = _probe_one_k(mid, top_pool)
+
+                    if r_mid["flipped"] or r_mid["gap"] < 0.0:
+                        best_k = mid
+                        hi = mid - 1
+                    else:
+                        lo = mid + 1
+
+                return int(best_k), dense_results
 
             def _find_collapse_pair(results: list[dict]) -> tuple[typing.Optional[dict], typing.Optional[dict]]:
                 """
@@ -1025,20 +1144,27 @@ class PerturbMiner:
                 # Refresh time guard after each expansion.
                 time_left = grow_deadline - time.perf_counter()
 
-            # 2. If coarse already flips, choose smallest flipping candidate.
+            # 2. If coarse already flips, fine-search inside the flipping interval.
             flipped = [r for r in results if r["flipped"] or r["gap"] < 0.0]
             if flipped:
                 chosen = min(flipped, key=lambda r: r["k"])
-                n_pick = int(chosen["k"])
-                logger.info(
-                    f"[BATCH_PROBE_FLIP] coarse={[(r['k'], round(r['gap'],5), round(r['drop'],5)) for r in results]} "
-                    f"chosen={n_pick} gap={chosen['gap']:.5f} "
-                    f"drop={chosen['drop']:.5e} eff={chosen['eff']:.2e} "
-                    f"trust={chosen['trust']:.2f}"
-                )
-                return n_pick, top_pool[:n_pick]
 
-            # 3. Detect trust-region collapse, then refine inside interval.
+                fine_k, dense_results = _fine_search_first_flip(
+                    top_pool=top_pool,
+                    results=results,
+                    chosen_flip=chosen,
+                )
+
+                logger.info(
+                    f"[BATCH_PROBE_FLIP_FINE] "
+                    f"coarse={[(r['k'], round(r['gap'],5), round(r['drop'],5)) for r in results]} "
+                    f"dense={[(r['k'], round(r['gap'],5), r['flipped']) for r in dense_results]} "
+                    f"coarse_chosen={chosen['k']} fine_chosen={fine_k}"
+                )
+
+                return int(fine_k), top_pool[:fine_k]
+
+            # 3. Detect trust-region collapse, then refine densely inside interval.
             last_good, first_weak = _find_collapse_pair(results)
 
             refine_results = []
@@ -1053,23 +1179,77 @@ class PerturbMiner:
                 hi = int(first_weak["k"])
                 span = hi - lo
 
-                refine_candidates = _dedupe_candidates([
+                # Dense interval steps.
+                # Example:
+                # 1024..2048 -> 1152,1280,1408,1536,1664,1792,1920
+                # 512..1024  -> 576,640,704,768,832,896,960
+                if span >= 2048:
+                    step = 128
+                elif span >= 1024:
+                    step = 128
+                elif span >= 512:
+                    step = 64
+                elif span >= 256:
+                    step = 32
+                elif span >= 128:
+                    step = 16
+                elif span >= 64:
+                    step = 8
+                else:
+                    step = max(1, span // max(_MAX_REFINE_PROBES + 1, 2))
+
+                refine_candidates = list(range(lo + step, hi, step))
+
+                # Also add fractional probes as backup.
+                refine_candidates += [
                     lo + int(round(span * (j / (_MAX_REFINE_PROBES + 1))))
                     for j in range(1, _MAX_REFINE_PROBES + 1)
-                ])
+                ]
 
-                # Avoid re-probing candidates already tested.
-                already = {r["k"] for r in results}
-                refine_candidates = [k for k in refine_candidates if k not in already]
+                already = {int(r["k"]) for r in results}
+                refine_candidates = sorted({
+                    int(k)
+                    for k in refine_candidates
+                    if lo < int(k) < hi and int(k) not in already
+                })
 
                 if refine_candidates:
-                    # Make sure top_pool is large enough for refinement.
                     all_candidates = _dedupe_candidates(
                         candidates + refine_candidates,
                         cap=min(valid_count, _MAX_EXPANDED_BATCH),
                     )
+
                     results, top_pool = _probe_candidates(all_candidates)
                     refine_results = [r for r in results if r["k"] in refine_candidates]
+
+                    logger.info(
+                        f"[BATCH_REFINE_DENSE] lo={lo} hi={hi} "
+                        f"refine={[(r['k'], round(r['gap'],5), round(r['drop'],5)) for r in refine_results]}"
+                    )
+
+                    # If dense refine discovers a flip, do not return the coarse flip.
+                    # Fine-search the smallest flipping k immediately.
+                    flipped_after_refine = [
+                        r for r in results
+                        if r["flipped"] or r["gap"] < 0.0
+                    ]
+
+                    if flipped_after_refine:
+                        chosen_flip = min(flipped_after_refine, key=lambda r: r["k"])
+
+                        fine_k, dense_flip_results = _fine_search_first_flip(
+                            top_pool=top_pool,
+                            results=results,
+                            chosen_flip=chosen_flip,
+                        )
+
+                        logger.info(
+                            f"[BATCH_REFINE_FLIP_FINE] "
+                            f"chosen_flip={chosen_flip['k']} fine_chosen={fine_k} "
+                            f"dense={[(r['k'], round(r['gap'],5), r['flipped']) for r in dense_flip_results]}"
+                        )
+
+                        return int(fine_k), top_pool[:fine_k]
 
             # 4. Choose final candidate.
             chosen = _choose_from_results(results)
@@ -1365,16 +1545,12 @@ class PerturbMiner:
                         _snapped, _margin, _pred,
                         tag="CHECK", gap_now=min(cur_gap, rank2_gap), selected_snapshot=selected.copy(),
                     )
-                    if attack_phase == "safety_grow" and _margin <= _SAFETY_GROW_TARGET:
+                    # Stop growth as soon as PNG-roundtrip hard flip is barely safe.
+                    # Do not keep growing to deep safety margin.
+                    if _is_hard_flip(_margin) and best_hard_result is not None:
                         logger.info(
-                            f"[SAFETY_GROW_DONE] k={len(selected)} "
-                            f"margin={_margin:.5f} — target reached, stopping growth"
-                        )
-                        break
-                    if _is_strong_safe(_margin) and best_hard_result is not None:
-                        logger.info(
-                            f"[STRONG_SAFE] k={len(selected)} "
-                            f"margin={_margin:.5f} — stopping growth"
+                            f"[BOUNDARY_SAFE_CHECK] k={len(selected)} "
+                            f"margin={_margin:.6f} — stopping growth"
                         )
                         break
 
@@ -1446,40 +1622,50 @@ class PerturbMiner:
             prev_batch_size = n_pick
             # Post-batch flip check: record and decide whether to stop growth.
             _flipped2, _margin2, _snapped2, _pred2 = check_flip(current_adv)
+
             if len(selected) > 0:
                 _record_candidate(
-                    _snapped2, _margin2, _pred2,
-                    tag="BATCH", gap_now=_margin2, selected_snapshot=selected.copy(),
+                    _snapped2,
+                    _margin2,
+                    _pred2,
+                    tag="BATCH",
+                    gap_now=_margin2,
+                    selected_snapshot=selected.copy(),
                 )
+
             if _flipped2:
                 has_soft_flip = True
+
                 if attack_phase == "grow":
                     attack_phase = "safety_grow"
                     logger.info(
-                        f"[FIRST_SOFT_FLIP] k={len(selected)} margin={_margin2:.5f} "
-                        f"— entering safety grow"
+                        f"[FIRST_FLIP] k={len(selected)} margin={_margin2:.6f} "
+                        f"— entering tiny safety mode"
                     )
                     log_attack(
-                        f"[FIRST_SOFT_FLIP] k={len(selected)} margin={_margin2:.5f}"
+                        f"[FIRST_FLIP] k={len(selected)} margin={_margin2:.6f}"
                     )
-                if _is_soft_flip(_margin2) and not _is_hard_flip(_margin2):
-                    # Soft flip only — keep adding pixels to build safety margin.
-                    continue
-                if attack_phase == "safety_grow" and _margin2 <= _SAFETY_GROW_TARGET:
+
+                # Main change:
+                # Stop as soon as the PNG-roundtrip hard flip is barely safe.
+                # Do not push to deep negative margin.
+                if _is_hard_flip(_margin2):
                     logger.info(
-                        f"[SAFETY_GROW_DONE] k={len(selected)} margin={_margin2:.5f} "
-                        f"— target reached, stopping growth for elimination"
+                        f"[BOUNDARY_SAFE_FLIP] k={len(selected)} margin={_margin2:.6f} "
+                        f"— stop growth and start elimination"
+                    )
+                    log_attack(
+                        f"[BOUNDARY_SAFE_FLIP] k={len(selected)} margin={_margin2:.6f}"
                     )
                     break
-                if _is_hard_flip(_margin2) and _is_strong_safe(_margin2):
-                    logger.info(
-                        f"[STRONG_SAFE] k={len(selected)} margin={_margin2:.5f} "
-                        f"— stopping growth for elimination"
-                    )
-                    break
-                if attack_phase == "safety_grow":
-                    # Hard but weak margin — continue safety grow.
-                    continue
+
+                # Soft flip only. Continue with tiny safety batch.
+                # Because _MAX_SAFETY_GROW_BATCH is now 4, this will not explode RMSE.
+                logger.info(
+                    f"[SOFT_FLIP_TINY_GROW] k={len(selected)} margin={_margin2:.6f} "
+                    f"needs <= {_FLIP_MARGIN_EPS:.6f}"
+                )
+                continue
 
         # Resolve best candidate: hard > soft > lowest-gap progress > None.
         best_result = best_hard_result
