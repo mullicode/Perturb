@@ -658,7 +658,7 @@ class PerturbMiner:
         target_idx = best_target["target"]
         # Keep k_est closer to sparse estimate.
         # Over-inflating k_est makes get_batch more aggressive.
-        k_est = max(int(best_target["k_estimated"] * 1.15), 300)
+        k_est = max(int(best_target["k_estimated"] * 1.15), 50)
         logger.info(
             f"[TARGET] best={target_idx} "
             f"est_rmse={best_target['estimated_rmse']:.2e} "
@@ -1288,6 +1288,7 @@ class PerturbMiner:
             )
 
             return n_pick, top_pool[:n_pick]
+            
         def check_flip(adv_float):
             """
             Verify flip on uint8-snapped + PNG-roundtripped image to match validator numerics.
@@ -1319,9 +1320,6 @@ class PerturbMiner:
 
         def _is_hard_flip(margin: float) -> bool:
             return margin <= _FLIP_MARGIN_EPS
-
-        def _is_strong_safe(margin: float) -> bool:
-            return margin <= _STRONG_SAFE_MARGIN
 
         def _record_candidate(
             snapped,
@@ -1680,36 +1678,24 @@ class PerturbMiner:
                 )
                 continue
 
-        # Resolve best candidate: hard > soft > lowest-gap progress > None.
+        # ── Resolve submit candidate (hard flip only) ─────────────────────
+        # Soft/progress candidates are tracked for diagnostics but never
+        # submitted — the validator rejects weak margins as label_match_with_original.
         best_result = best_hard_result
-        if best_result is None:
+        if best_result is None and len(selected) > 0:
             _flipped_final, _margin_final, _snapped_final, _pred_final = check_flip(current_adv)
-            if len(selected) > 0:
-                _record_candidate(
-                    _snapped_final, _margin_final, _pred_final,
-                    tag="LATE", gap_now=min(cur_gap, rank2_gap), selected_snapshot=selected.copy(),
-                )
+            _record_candidate(
+                _snapped_final, _margin_final, _pred_final,
+                tag="LATE", gap_now=min(cur_gap, rank2_gap), selected_snapshot=selected.copy(),
+            )
             best_result = best_hard_result
 
-        # Do NOT submit soft/progress candidates.
-        # Validator rejects these as label_match_with_original when the margin is too close to zero.
         if best_result is None:
             logger.warning(
                 "[NO_HARD_FLIP] No PNG-safe hard flip found. "
                 "Returning None; validator may score this as label_match_with_original because no valid attack is available."
             )
             log_attack("[NO_HARD_FLIP] no PNG-safe hard flip", estimated_score=0.0)
-            return None
-
-        if best_result is None:
-            if len(selected) == 0:
-                logger.warning("[ATTACK] No perturbation created — returning clean")
-                log_attack("[ATTACK] No perturbation created")
-                return None
-            logger.warning(
-                f"[ATTACK] No hard flip after {len(selected)} pixels"
-            )
-            log_attack(f"[ATTACK] No hard flip after {len(selected)} pixels")
             return None
 
         # ── Phase 4: backward elimination ─────────────────────────────────
@@ -1760,7 +1746,7 @@ class PerturbMiner:
             # Margin-preserving: only accept if hard flip survives PNG roundtrip.
             return _probe_margin(adv_float) is not None
 
-        # ── Prefix binary shrink first ─────────────────────────────
+        # ── Phase 4a: prefix binary shrink ────────────────────────────────
         # Finds smallest prefix of selected pixels that still flips.
         # This is very fast and often removes a lot of late-added pixels.
         lo, hi = 1, len(sel)
@@ -1786,9 +1772,10 @@ class PerturbMiner:
             sel = best_prefix
             curr = best_prefix_adv
 
+        # ── Phase 4b: block chunk elimination ─────────────────────────────
         block = max(1, len(sel) // 4)
         while block >= 1 and time.perf_counter() < elim_deadline:
-            improved = False
+            chunk_removed = False
             # Try removing lower-priority later pixels first.
             starts = list(range(max(0, len(sel) - block), -1, -block))
             if 0 not in starts:
@@ -1811,20 +1798,20 @@ class PerturbMiner:
                 if still_flips(trial):
                     sel = trial_sel
                     curr = trial
-                    improved = True
+                    chunk_removed = True
                     logger.info(
                         f"[ELIM_CHUNK] removed={end-start} k={len(sel)} block={block}"
                     )
                     break
 
-            if not improved:
+            if not chunk_removed:
                 block //= 2
-        improved = True
-        logger.info(f"[ELIM] k_initial={len(sel)} elim_budget={elim_budget}")
 
-        while improved and time.perf_counter() < elim_deadline:
-            improved = False
- 
+        # ── Phase 4c: gradient-guided single-pixel elimination ────────────
+        pixel_improved = True
+        while pixel_improved and time.perf_counter() < elim_deadline:
+            pixel_improved = False
+
             # Rank pixels by weakest gradient contribution — try removing first
             x_e = curr.detach().requires_grad_(True)
             lg_e = logits_for_images(
@@ -1836,7 +1823,7 @@ class PerturbMiner:
                 range(len(sel)),
                 key=lambda i: g_e[sel[i]].item()
             )
- 
+
             for pos in order:
                 if time.perf_counter() > elim_deadline:
                     break
@@ -1845,9 +1832,9 @@ class PerturbMiner:
                 if still_flips(trial_adv):
                     sel = trial
                     curr = trial_adv
-                    improved = True
-                    break   # restart with updated gradient
- 
+                    pixel_improved = True
+                    break  # restart with updated gradient
+
         k_final = len(sel)
         logger.info(f"[ELIM] k_final={k_final}")
 
@@ -1884,6 +1871,7 @@ class PerturbMiner:
             )
             final_pred = int(final_q.pred)
             final_margin = float(final_q.margin)
+            final_preflight = _preflight_flip_only(final_q, true_idx, challenge_epsilon)
 
         rmse = float(final_q.rmse)
 
@@ -1899,7 +1887,6 @@ class PerturbMiner:
             norm=final_q.norm,
             estimated_score=final_score,
         )
-        final_preflight = _preflight_flip_only(final_q, true_idx, challenge_epsilon)
         if not final_preflight.ok:
             logger.warning(
                 f"[FINAL_BLOCKED] reason={final_preflight.reason} "
