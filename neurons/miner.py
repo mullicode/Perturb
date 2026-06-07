@@ -732,12 +732,11 @@ class PerturbMiner:
 
             if is_first_cycle:
                 is_first_cycle = False
-                prev_batch_size = CALIBRATION_BATCH
-                return CALIBRATION_BATCH, None, None
+                return CALIBRATION_BATCH
 
             time_remaining = grow_deadline - time.perf_counter()
             if time_remaining <= 0:
-                return 1, None, None
+                return 1
 
             gap_rate = _estimate_gap_rate()
 
@@ -773,7 +772,7 @@ class PerturbMiner:
             batch = min(batch, max(1, N - k_cur))
             batch = min(batch, 50000)
 
-            return int(max(1, batch)), gap_rate, pixels_needed
+            return int(max(1, batch))
 
         def choose_batch_by_marginal_probe(
             *,
@@ -804,9 +803,6 @@ class PerturbMiner:
 
             min_b, max_b = _stage_limits(cur_gap, has_soft_flip=has_soft_flip, phase=phase)
             max_b = min(max_b, valid_count)
-
-            if max_b <= 0:
-                return 0, torch.empty(0, dtype=torch.long, device=self.device)
 
             time_left = grow_deadline - time.perf_counter()
 
@@ -1400,10 +1396,8 @@ class PerturbMiner:
         gap_at_last_switch = gap  # tracks gap_initial for fallback after target switches
         g_t = best_target["gradient"]
         g_norm1 = g_t.abs().sum().item()
-        lambda_prior = (eps * g_norm1) / (gap_initial * N)
-
-        CALIBRATION_BATCH = max(5, int(0.10 / max(lambda_prior, 1e-8)))
-        CALIBRATION_BATCH = min(CALIBRATION_BATCH, 200)
+        calibration_prior = (eps * g_norm1) / max(gap_initial * N, 1e-8)
+        CALIBRATION_BATCH = max(5, min(int(0.10 / calibration_prior), 200))
         is_first_cycle = True
 
         gap_history = [(0, gap_initial, time.perf_counter())]
@@ -1567,7 +1561,7 @@ class PerturbMiner:
 
             # First get only a smooth estimate. Final batch will be selected
             # after current valid pixels and saliency are known.
-            batch_estimate, _, _ = get_batch_estimate(
+            batch_estimate = get_batch_estimate(
                 len(selected), cur_gap, last_batch_time,
                 has_soft_flip=has_soft_flip, phase=attack_phase,
             )
